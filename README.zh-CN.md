@@ -13,7 +13,7 @@
 - OMP 重启后清空目录授权; 不同工作区之间不共享授权。
 - 没有交互 UI 时, 需要确认但尚未授权的外部写入会被拒绝。
 - 检查和记录目录前会解析符号链接。
-- 新建临时命名空间可按 `temporary` 规则自动获得当前进程的临时所有权。默认允许新建 `/tmp/<name>`; 工具成功创建后, 同一进程和工作区可以修改或删除该命名空间。
+- 新建临时命名空间可按 `temporary` 规则自动获得当前进程的临时所有权。默认允许新建 `/tmp/<name>`; 工具成功创建后, 同一进程和工作区可以修改或删除该命名空间。`eval` 代码创建命名空间后, 成功结果报告新路径时也会自动认领。
 - 既有临时命名空间不会被自动认领。临时所有权在 OMP 重启后清空, 也不会跨工作区共享。
 - Bash 自动审批开启时, 插件仍检查命令行中可识别的显式写入目标。
 - `git push` 使用独立策略, 默认直接拒绝。
@@ -181,7 +181,7 @@ omp plugin install omp-workspace-write-guard@fcying-omp-plugins
 - LSP 修改操作
 - 带显式写入目标的常见 Bash 命令
 
-Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `touch`, `truncate`, `cp`, `mv`, `install`, `ln`, `chmod`, `chown`, `chgrp`, `tee`, `dd of=`, 原地修改的 `sed` / `perl`, 以及会修改仓库的 Git 命令。比较前会解析结构化 Bash `cwd`, `cd`, Git `-C`, glob, home 路径和符号链接。只有工具结果确认目录已经创建后, 插件才会授予新临时命名空间当前进程的所有权。
+Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `touch`, `truncate`, `cp`, `mv`, `install`, `ln`, `chmod`, `chown`, `chgrp`, `tee`, `dd of=`, 原地修改的 `sed` / `perl`, 以及会修改仓库的 Git 命令。比较前会解析结构化 Bash `cwd`, `cd`, Git `-C`, glob, home 路径和符号链接。只有工具结果确认目录已经创建后, 插件才会授予新临时命名空间当前进程的所有权。对于 `eval`, 插件会比较配置的临时根目录快照, 仅认领成功结果中报告了完整路径的新增一级命名空间。
 
 `git push` 检测覆盖直接调用、wrapper、`git -C`、Git 全局选项和复合命令。`gitPush: "deny"` 时立即拒绝且不打开确认框; `"prompt"` 时独立确认; `"allow"` 时仍保留仓库路径检查。
 
@@ -193,7 +193,7 @@ Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `touch`, `trunc
 
 本插件用于防止误写, 不是操作系统沙箱。shell 解析器无法证明任意命令的实际副作用。
 
-自动批准 Bash 会信任 `just`, `make`, `npm`, `cargo`, Python 和项目二进制等 runner 或脚本。它们可以在最终目标没有出现在 Bash 工具参数中时写入工作区外。命令替换、动态 shell 展开、被 source 的脚本、alias、函数和未知命令也有同样限制。
+自动批准 Bash 会信任 `just`, `make`, `npm`, `cargo`, Python 和项目二进制等 runner 或脚本。它们可以在最终目标没有出现在 Bash 工具参数中时写入工作区外。命令替换、动态 shell 展开、被 source 的脚本、alias、函数和未知命令也有同样限制。临时根目录快照只能识别结果中报告的新命名空间, 不能审计代码的其他副作用。
 
 需要强制文件系统边界时, 使用 Bubblewrap、容器或虚拟机。
 

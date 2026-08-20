@@ -479,6 +479,94 @@ test("owns a newly created temporary namespace for its lifecycle", async (t) => 
   assert.equal(deletion, undefined);
 });
 
+test("owns a temporary namespace reported by eval", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  const created = await mkdtemp(join(tmpdir(), "set-omp-test-"));
+  await rm(created, { recursive: true });
+  t.after(() => rm(created, { recursive: true, force: true }));
+  const { call, result } = registerLifecycleHandlers(agentDir);
+
+  const execution = await call(
+    { toolCallId: "eval-create-temp", toolName: "eval", input: { language: "python", code: "tempfile.mkdtemp()" } },
+    context(workspace),
+  );
+  await mkdir(created);
+  await result({
+    toolCallId: "eval-create-temp",
+    toolName: "eval",
+    input: {},
+    isError: false,
+    content: [{ type: "text", text: created }],
+  });
+
+  const update = await call(
+    { toolCallId: "update-eval-temp", toolName: "write", input: { path: join(created, "file.txt"), content: "ok" } },
+    context(workspace),
+  );
+  const deletion = await call(
+    { toolCallId: "delete-eval-temp", toolName: "bash", input: { command: `rm -rf ${created}` } },
+    context(workspace),
+  );
+
+  assert.equal(execution, undefined);
+  assert.equal(update, undefined);
+  assert.equal(deletion, undefined);
+});
+
+test("does not claim pre-existing, failed, or unreported eval temporary namespaces", async (t) => {
+  const { root, workspace, agentDir } = await fixture(t);
+  const temporaryRoot = join(root, "temporary");
+  const existing = join(temporaryRoot, "existing");
+  const failed = join(temporaryRoot, "failed");
+  const unreported = join(temporaryRoot, "unreported");
+  await mkdir(existing, { recursive: true });
+  await writeConfig(join(workspace, ".omp"), { temporary: { root: temporaryRoot } });
+  const { call, result } = registerLifecycleHandlers(agentDir);
+
+  await call(
+    { toolCallId: "eval-failed-temp", toolName: "eval", input: { language: "python", code: "raise RuntimeError()" } },
+    context(workspace),
+  );
+  await mkdir(failed);
+  await result({
+    toolCallId: "eval-failed-temp",
+    toolName: "eval",
+    input: {},
+    isError: true,
+    content: [],
+  });
+
+  await call(
+    { toolCallId: "eval-unreported-temp", toolName: "eval", input: { language: "python", code: "print('done')" } },
+    context(workspace),
+  );
+  await mkdir(unreported);
+  await result({
+    toolCallId: "eval-unreported-temp",
+    toolName: "eval",
+    input: {},
+    isError: false,
+    content: [{ type: "text", text: "done" }],
+  });
+
+  const existingDeletion = await call(
+    { toolCallId: "delete-existing-temp", toolName: "bash", input: { command: `rm -rf ${existing}` } },
+    context(workspace),
+  );
+  const failedDeletion = await call(
+    { toolCallId: "delete-failed-eval-temp", toolName: "bash", input: { command: `rm -rf ${failed}` } },
+    context(workspace),
+  );
+  const unreportedDeletion = await call(
+    { toolCallId: "delete-unreported-eval-temp", toolName: "bash", input: { command: `rm -rf ${unreported}` } },
+    context(workspace),
+  );
+
+  assert.equal(existingDeletion.block, true);
+  assert.equal(failedDeletion.block, true);
+  assert.equal(unreportedDeletion.block, true);
+});
+
 test("does not claim existing or unsuccessfully created temporary namespaces", async (t) => {
   const { workspace, outside } = await fixture(t);
   const { call, result } = registerLifecycleHandlers();

@@ -1,6 +1,6 @@
 import { loadGuardConfig, type GuardConfig } from "./config.ts";
 import { bashWriteTargets } from "./bash-targets.ts";
-import { lstat, readlink, realpath } from "node:fs/promises";
+import { lstat, readdir, readlink, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import {
   basename,
@@ -27,7 +27,12 @@ const MUTATING_LSP_ACTIONS: Record<string, true> = {
 };
 const approvedDirectoriesByWorkspace = new Map<string, Set<string>>();
 const ownedTemporaryPathsByWorkspace = new Map<string, Set<string>>();
-const pendingTemporaryChecks = new Map<string, { workspace: string; candidates: string[] }>();
+const pendingTemporaryChecks = new Map<string, {
+  workspace: string;
+  candidates: string[];
+  temporaryRoot?: string;
+  existingNamespaces?: Set<string>;
+}>();
 const resolvedConfigs = new Map<string, Promise<ResolvedGuardConfig>>();
 
 type ToolInput = Record<string, unknown>;
@@ -255,6 +260,16 @@ function temporaryNamespace(temporaryRoot: string, target: string): string | und
   return join(temporaryRoot, rel.split(sep)[0]);
 }
 
+async function temporaryNamespaces(temporaryRoot: string): Promise<Set<string> | undefined> {
+  try {
+    return new Set((await readdir(temporaryRoot)).map((name) => join(temporaryRoot, name)));
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return new Set();
+    return undefined;
+  }
+}
+
+
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
@@ -287,7 +302,8 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     }
 
     const targets = targetsFor(event.toolName, input, ctx.cwd);
-    if (targets.length === 0) return;
+    const observesTemporary = event.toolName === "eval";
+    if (targets.length === 0 && !observesTemporary) return;
 
     let root: string;
     let config: ResolvedGuardConfig;
@@ -315,6 +331,20 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
 
     const approvedDirectories = approvedDirectorySet(root);
     const ownedTemporaryPaths = ownedTemporaryPathSet(root);
+    const existingTemporaryNamespaces = observesTemporary && config.values.temporary.allowOwned
+      ? await temporaryNamespaces(config.temporaryRoot)
+      : undefined;
+    if (targets.length === 0) {
+      if (existingTemporaryNamespaces && typeof event.toolCallId === "string") {
+        pendingTemporaryChecks.set(event.toolCallId, {
+          workspace: root,
+          candidates: [],
+          temporaryRoot: config.temporaryRoot,
+          existingNamespaces: existingTemporaryNamespaces,
+        });
+      }
+      return;
+    }
     const provisionalTemporaryPaths = new Set<string>();
     const temporaryCandidates = new Set<string>();
     const external: Array<{ display: string; directory?: string }> = [];
@@ -385,6 +415,8 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
         pendingTemporaryChecks.set(event.toolCallId, {
           workspace: root,
           candidates: [...temporaryCandidates],
+          temporaryRoot: existingTemporaryNamespaces ? config.temporaryRoot : undefined,
+          existingNamespaces: existingTemporaryNamespaces,
         });
       }
       return;
@@ -421,6 +453,8 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
       pendingTemporaryChecks.set(event.toolCallId, {
         workspace: root,
         candidates: [...temporaryCandidates],
+        temporaryRoot: existingTemporaryNamespaces ? config.temporaryRoot : undefined,
+        existingNamespaces: existingTemporaryNamespaces,
       });
     }
   });
@@ -431,12 +465,29 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     pendingTemporaryChecks.delete(event.toolCallId);
 
     const ownedTemporaryPaths = ownedTemporaryPathSet(pending.workspace);
-    for (const candidate of pending.candidates) {
-      try {
-        await lstat(candidate);
-        ownedTemporaryPaths.add(candidate);
-      } catch {
-        // A failed or self-cleaning operation owns no persistent path.
+    if (!event.isError) {
+      const candidates = new Set(pending.candidates);
+      if (pending.temporaryRoot && pending.existingNamespaces) {
+        const currentNamespaces = await temporaryNamespaces(pending.temporaryRoot);
+        const reportedPaths = new Set(
+          event.content
+            .filter((item): item is { type: "text"; text: string } => item.type === "text")
+            .flatMap((item) => item.text.split(/\r?\n/).map((line) => line.trim())),
+        );
+        if (currentNamespaces) {
+          for (const namespace of currentNamespaces) {
+            if (!pending.existingNamespaces.has(namespace) && reportedPaths.has(namespace)) candidates.add(namespace);
+          }
+        }
+      }
+
+      for (const candidate of candidates) {
+        try {
+          await lstat(candidate);
+          ownedTemporaryPaths.add(candidate);
+        } catch {
+          // A self-cleaning operation owns no persistent path.
+        }
       }
     }
 
