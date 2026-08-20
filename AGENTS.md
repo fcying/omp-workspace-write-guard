@@ -19,11 +19,11 @@ This plugin is an accidental-write guard, not an operating-system sandbox. Never
 
 ## Repository Structure
 
+- `.omp-plugin/marketplace.json`: OMP marketplace catalog for repository-based discovery, installation, and upgrades.
 - `index.ts`: OMP extension entry point, path normalization, symbolic-link resolution, configured policy enforcement, directory approval cache, and confirmation flow.
 - `bash-targets.ts`: explicit Bash write-target and `git push` detection.
 - `config.ts` and `workspace-write-guard.json`: layered configuration loading, validation, and defaults.
-- `tests/workspace-write-guard.test.mjs`: observable permission behavior tests.
-- `README.md`: installation, configuration, supported behavior, and security boundaries.
+- `README.md` and `README.zh-CN.md`: synchronized English-default and Chinese installation, configuration, supported behavior, and security boundaries.
 - `package.json`: OMP plugin manifest and package version.
 
 ## Implementation Rules
@@ -49,8 +49,10 @@ Run these commands after every behavioral change:
 npm test
 node --check index.ts
 node --check bash-targets.ts
+node --check config.ts
 node --check tests/workspace-write-guard.test.mjs
 npm pack --dry-run
+omp plugin discover fcying-omp-plugins --json
 ```
 
 New or changed permission rules require behavioral tests that fail under a plausible incorrect implementation. Keep coverage for:

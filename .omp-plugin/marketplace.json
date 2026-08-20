@@ -1,0 +1,36 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "fcying-omp-plugins",
+  "owner": {
+    "name": "fcying"
+  },
+  "metadata": {
+    "description": "OMP plugins maintained by fcying.",
+    "version": "0.4.1"
+  },
+  "plugins": [
+    {
+      "name": "omp-workspace-write-guard",
+      "description": "Guard writes outside the current OMP workspace with configurable path and command policies.",
+      "version": "0.4.1",
+      "source": "./",
+      "author": {
+        "name": "fcying"
+      },
+      "homepage": "https://github.com/fcying/omp-workspace-write-guard",
+      "repository": "https://github.com/fcying/omp-workspace-write-guard.git",
+      "category": "security",
+      "keywords": [
+        "oh-my-pi",
+        "omp",
+        "security",
+        "workspace"
+      ],
+      "tags": [
+        "filesystem",
+        "permissions",
+        "write-guard"
+      ]
+    }
+  ]
+}
