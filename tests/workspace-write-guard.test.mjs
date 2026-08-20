@@ -75,27 +75,46 @@ test("blocks direct writes outside the workspace without a UI", async (t) => {
   assert.match(result.reason, /outside\/file\.ts/);
 });
 
-test("prompts for outside writes and honors the decision", async (t) => {
+test("remembers an approved external directory for the current process", async (t) => {
   const { workspace, outside } = await fixture(t);
+  const other = join(outside, "..", "other");
+  await mkdir(other);
   const handler = registerHandler();
-  const target = join(outside, "file.ts");
-  const approvedPrompts = [];
-  const deniedPrompts = [];
+  const prompts = [];
 
   const approved = await handler(
-    { toolName: "write", input: { path: target, content: "ok" } },
-    context(workspace, { hasUI: true, approve: true, prompts: approvedPrompts }),
+    { toolName: "write", input: { path: join(outside, "first.ts"), content: "ok" } },
+    context(workspace, { hasUI: true, approve: true, prompts }),
   );
-  const denied = await handler(
-    { toolName: "write", input: { path: target, content: "blocked" } },
-    context(workspace, { hasUI: true, approve: false, prompts: deniedPrompts }),
+  const cached = await handler(
+    { toolName: "write", input: { path: join(outside, "nested", "second.ts"), content: "ok" } },
+    context(workspace),
+  );
+  const uncached = await handler(
+    { toolName: "write", input: { path: join(other, "blocked.ts"), content: "blocked" } },
+    context(workspace),
   );
 
   assert.equal(approved, undefined);
-  assert.equal(approvedPrompts.length, 1);
+  assert.equal(cached, undefined);
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0].body, /Remember for this OMP process/);
+  assert.equal(uncached.block, true);
+});
+
+test("honors denial for an uncached external directory", async (t) => {
+  const { workspace, outside } = await fixture(t);
+  const handler = registerHandler();
+  const prompts = [];
+
+  const denied = await handler(
+    { toolName: "write", input: { path: join(outside, "blocked.ts"), content: "blocked" } },
+    context(workspace, { hasUI: true, approve: false, prompts }),
+  );
+
   assert.equal(denied.block, true);
   assert.match(denied.reason, /User denied write outside workspace/);
-  assert.equal(deniedPrompts.length, 1);
+  assert.equal(prompts.length, 1);
 });
 
 test("blocks workspace symlinks that resolve outside", async (t) => {
@@ -154,20 +173,112 @@ test("guards AST edit scopes but allows internal devices", async (t) => {
   assert.equal(internal, undefined);
 });
 
-test("allows LSP reads and guards LSP mutations", async (t) => {
-  const { workspace } = await fixture(t);
+test("allows workspace LSP changes and guards external destinations", async (t) => {
+  const { workspace, outside } = await fixture(t);
   const handler = registerHandler();
 
   const read = await handler(
     { toolName: "lsp", input: { action: "references", file: "src/file.ts" } },
     context(workspace),
   );
-  const mutation = await handler(
+  const workspaceMutation = await handler(
     { toolName: "lsp", input: { action: "rename", file: "src/file.ts", new_name: "renamed" } },
+    context(workspace),
+  );
+  const externalMutation = await handler(
+    {
+      toolName: "lsp",
+      input: {
+        action: "rename_file",
+        file: "src/file.ts",
+        new_name: join(outside, "file.ts"),
+      },
+    },
     context(workspace),
   );
 
   assert.equal(read, undefined);
-  assert.equal(mutation.block, true);
-  assert.match(mutation.reason, /LSP rename/);
+  assert.equal(workspaceMutation, undefined);
+  assert.equal(externalMutation.block, true);
+  assert.match(externalMutation.reason, /outside\/file\.ts/);
+});
+
+test("allows common Bash reads, project runners, and workspace writes", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+  const commands = [
+    "git rev-parse HEAD",
+    "just test",
+    "git add .",
+    "touch generated.txt",
+    "printf ok > generated.txt",
+    "run-tests 2>&1",
+  ];
+
+  for (const command of commands) {
+    const result = await handler({ toolName: "bash", input: { command } }, context(workspace));
+    assert.equal(result, undefined, command);
+  }
+});
+
+test("hard-blocks git push without prompting", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+  const prompts = [];
+  const commands = [
+    "git push",
+    "git push origin main",
+    "git -C . push --force",
+    "git -c advice.detachedHead=false push",
+    "git --git-dir .git push",
+    "sudo git push",
+    "git status && git push",
+  ];
+
+  for (const command of commands) {
+    const result = await handler(
+      { toolName: "bash", input: { command } },
+      context(workspace, { hasUI: true, approve: true, prompts }),
+    );
+    assert.equal(result.block, true, command);
+    assert.equal(result.reason, "git push is blocked by workspace write guard", command);
+  }
+  assert.equal(prompts.length, 0);
+});
+
+test("blocks explicit Bash writes outside the workspace", async (t) => {
+  const { workspace, outside } = await fixture(t);
+  const handler = registerHandler();
+  const commands = [
+    `touch ${join(outside, "touch.txt")}`,
+    `printf ok > ${join(outside, "redirect.txt")}`,
+    `cd ${outside} && mkdir nested`,
+    "git -C ../outside add .",
+    `cp source.txt ${join(outside, "copy.txt")}`,
+  ];
+
+  for (const command of commands) {
+    const result = await handler({ toolName: "bash", input: { command } }, context(workspace));
+    assert.equal(result.block, true, command);
+    assert.match(result.reason, /Write outside workspace blocked/, command);
+  }
+});
+
+test("reuses an approved directory for Bash targets", async (t) => {
+  const { workspace, outside } = await fixture(t);
+  const handler = registerHandler();
+  const prompts = [];
+
+  const approved = await handler(
+    { toolName: "bash", input: { command: `touch ${join(outside, "first.txt")}` } },
+    context(workspace, { hasUI: true, approve: true, prompts }),
+  );
+  const cached = await handler(
+    { toolName: "bash", input: { command: `printf ok > ${join(outside, "nested", "second.txt")}` } },
+    context(workspace),
+  );
+
+  assert.equal(approved, undefined);
+  assert.equal(cached, undefined);
+  assert.equal(prompts.length, 1);
 });

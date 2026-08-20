@@ -1,48 +1,59 @@
 # OMP Workspace Write Guard
 
-Adds write-confirmation behavior to Oh My Pi similar to OpenCode's `external_directory` permission:
+Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `external_directory` permission.
 
-- Reads and file modifications within the current workspace are allowed automatically.
-- Reads outside the workspace are allowed automatically.
+## Behavior
+
+- Reads anywhere are allowed automatically.
+- Direct file modifications inside the current workspace are allowed automatically.
 - Direct file modifications outside the workspace require interactive confirmation.
-- Direct file modifications outside the workspace are denied when no interactive UI is available.
-- Symbolic links inside the workspace that point to external directories are treated as paths outside the workspace.
-- Arbitrary code-execution tools such as `bash`, `eval`, `task`, and `browser` continue to use OMP's own approval system.
+- Approving an external target remembers its real parent directory for the current OMP process and workspace. Later writes in that directory or its descendants do not prompt again.
+- Approvals reset when OMP restarts and are not shared across different workspaces.
+- External writes are denied when no interactive UI is available and the directory has not already been approved.
+- Symbolic links are resolved before checking or remembering a directory.
+- Common explicit Bash writes are checked when Bash is configured for automatic approval.
 
-## Requirements
+## Recommended low-prompt configuration
 
-- OMP 17.3.8 or later.
-- `tools.approvalMode` must be set to `write`.
+Keep the normal `write` approval mode, but auto-approve Bash:
 
 ```bash
 omp config set tools.approvalMode write
+omp config set tools.approval '{"bash":"allow"}'
 ```
 
-Do not use `yolo` or explicitly set `bash`, `eval`, `task`, or `browser` to `allow`. These tools can write to arbitrary paths indirectly, and their final write targets cannot be determined reliably from tool arguments alone.
-
-## Install from GitHub
-
-After publishing the repository, run the following commands on another machine:
+This removes approval prompts for commands such as:
 
 ```bash
-omp plugin install https://github.com/<github-user>/omp-workspace-write-guard
-omp config set tools.approvalMode write
+git rev-parse HEAD
+just test
+npm test
+cargo build
 ```
 
-Then restart OMP. The plugin is also loaded when a new process restores an existing session, unless `--no-extensions`, a different profile, or a different `PI_CODING_AGENT_DIR` is used.
+OMP's critical destructive-command guard may still force a prompt. Other executable tools such as `eval`, `task`, and `browser` retain OMP's normal approval behavior.
 
-## Link Locally
+Do not use `yolo` unless you accept that arbitrary executable tools can bypass path checks.
+
+## Install
 
 ```bash
-omp plugin link /path/to/omp-workspace-write-guard
+omp plugin install https://github.com/fcying/omp-workspace-write-guard
 omp config set tools.approvalMode write
+omp config set tools.approval '{"bash":"allow"}'
 ```
 
-If this repository is located directly under `~/.omp/agent/extensions/`, OMP discovers it automatically and no additional link is required.
+Restart OMP after installing or updating. A new process also loads the plugin when restoring an old session, unless it uses `--no-extensions`, another profile, or another `PI_CODING_AGENT_DIR`.
 
-## Coverage
+For local development:
 
-The plugin intercepts the following direct modification entry points:
+```bash
+omp plugin link /path/to/workspace-write-guard
+```
+
+## Covered modification paths
+
+The plugin intercepts:
 
 - `write`
 - `edit` / `apply_patch`
@@ -50,22 +61,21 @@ The plugin intercepts the following direct modification entry points:
 - `delete`
 - `move`
 - LSP modification operations
+- Common Bash commands with explicit write targets
 
-Paths are normalized and symbolic links are resolved. Regular files, archive entries, and SQLite row writes are evaluated using their underlying file paths. `local://` and `xd://` are internal OMP session resources and are not treated as external files.
+Bash checks cover shell output redirection, `rm`, `rmdir`, `mkdir`, `touch`, `truncate`, `cp`, `mv`, `install`, `ln`, `chmod`, `chown`, `chgrp`, `tee`, `dd of=`, in-place `sed`/`perl`, and mutating Git commands. Structured Bash `cwd`, `cd`, Git `-C`, globs, home paths, and symbolic links are resolved before comparison.
 
-LSP rename and code-action operations may return workspace edits that affect multiple files. Because the complete target list cannot be known before invocation, LSP modification operations always require separate confirmation.
+`git push` is always blocked immediately, including wrapped, `git -C`, and compound-command forms. It never opens an approval dialog and cannot be remembered or allowed for the process.
 
-## Security Boundary
+Regular files, archive entries, and SQLite row writes are evaluated using their underlying file paths. `local://` and `xd://` are OMP session resources and are not treated as external files.
 
-This plugin is not an operating-system sandbox. It prevents models from accidentally modifying files outside the current workspace through OMP file tools, but it cannot analyze the runtime side effects of arbitrary programs.
+LSP `request` remains separately confirmed because an arbitrary protocol request can cause server-initiated workspace edits whose targets are not available before execution.
 
-OMP's native execution approval remains the security boundary for:
+## Security boundary
 
-- Shell commands and project scripts.
-- Python and JavaScript evaluation.
-- Browser scripts.
-- Subagents and external tools.
-- In-process code from third-party plugins.
+This plugin is a guard against accidental writes, not an operating-system sandbox. A shell parser cannot prove the runtime side effects of arbitrary commands.
+
+In particular, auto-approved Bash trusts project runners and scripts such as `just`, `make`, `npm`, `cargo`, Python, and project binaries. A recipe or script can write outside the workspace without showing the final target in the Bash tool arguments. Command substitution, dynamic shell expansion, sourced scripts, aliases, functions, and unknown commands have the same limitation.
 
 Use Bubblewrap, a container, or a virtual machine when an enforceable filesystem boundary is required.
 
@@ -77,4 +87,4 @@ Node.js 22.18 or later:
 npm test
 ```
 
-The tests cover writes inside the workspace, denial outside the workspace, interactive approval and denial, symbolic-link escapes, AST edits, and LSP modification behavior.
+Tests cover workspace and external writes, remembered directory approval, symbolic-link escapes, AST and LSP edits, Bash redirection, Git commands, `cwd`/`cd`, and common file mutation commands.

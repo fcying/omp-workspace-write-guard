@@ -1,3 +1,4 @@
+import { bashWriteTargets } from "./bash-targets.ts";
 import { lstat, readlink, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import {
@@ -17,18 +18,20 @@ const PATCH_FILE = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+)\s*$/gm;
 const PATCH_MOVE = /^\*\*\* Move to:\s*(.+)\s*$/gm;
 const EDIT_MOVE = /^MV\s+(.+?)\s*$/gm;
 const ARCHIVE_OR_DB = /^(.*\.(?:tar\.gz|tgz|tar|zip|jar|war|ear|apk|sqlite|sqlite3|db|db3)):/i;
-const MUTATING_LSP_ACTIONS = new Set([
-  "rename",
-  "rename_file",
-  "code_actions",
-  "request",
-]);
+const MUTATING_LSP_ACTIONS: Record<string, true> = {
+  rename: true,
+  rename_file: true,
+  code_actions: true,
+  request: true,
+};
+const approvedDirectoriesByWorkspace = new Map<string, Set<string>>();
 
 type ToolInput = Record<string, unknown>;
 
 type Target =
-  | { kind: "path"; value: string }
-  | { kind: "opaque"; value: string };
+  | { kind: "path"; value: string; base?: string }
+  | { kind: "opaque"; value: string }
+  | { kind: "deny"; reason: string };
 
 function strings(value: unknown): string[] {
   if (typeof value === "string") return [value];
@@ -80,9 +83,15 @@ function writeTarget(raw: string): Target | undefined {
   return { kind: "path", value: container ?? value };
 }
 
-function targetsFor(toolName: string, input: ToolInput): Target[] {
+function targetsFor(toolName: string, input: ToolInput, cwd: string): Target[] {
   if (toolName === "write") {
     return strings(input.path).map(writeTarget).filter((target): target is Target => target !== undefined);
+  }
+
+  if (toolName === "bash") {
+    const command = typeof input.command === "string" ? input.command : "";
+    const requestedCwd = typeof input.cwd === "string" ? input.cwd : undefined;
+    return bashWriteTargets(command, cwd, requestedCwd);
   }
 
   if (toolName === "edit" || toolName === "apply_patch") {
@@ -100,10 +109,14 @@ function targetsFor(toolName: string, input: ToolInput): Target[] {
 
   if (toolName === "lsp") {
     const action = String(input.action ?? "");
-    if (!MUTATING_LSP_ACTIONS.has(action)) return [];
+    if (!Object.hasOwn(MUTATING_LSP_ACTIONS, action)) return [];
     if (action === "code_actions" && input.apply !== true) return [];
     if ((action === "rename" || action === "rename_file") && input.apply === false) return [];
-    return [{ kind: "opaque", value: `LSP ${action}` }];
+    if (action === "request") return [{ kind: "opaque", value: "LSP request" }];
+
+    const paths = strings(input.file);
+    if (action === "rename_file") paths.push(...strings(input.new_name));
+    return paths.map((value) => ({ kind: "path", value }));
   }
 
   if (toolName === "delete") {
@@ -166,6 +179,35 @@ function isWithin(root: string, target: string): boolean {
   const rel = relative(root, target);
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
+async function approvalDirectory(target: string): Promise<string> {
+  let staticPath = target;
+  while (/[?*[{]/.test(basename(staticPath))) staticPath = dirname(staticPath);
+
+  try {
+    const stat = await lstat(staticPath);
+    return stat.isDirectory() ? staticPath : dirname(staticPath);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+    return dirname(staticPath);
+  }
+}
+
+function approvedDirectorySet(workspace: string): Set<string> {
+  const existing = approvedDirectoriesByWorkspace.get(workspace);
+  if (existing) return existing;
+
+  const created = new Set<string>();
+  approvedDirectoriesByWorkspace.set(workspace, created);
+  return created;
+}
+
+function isApproved(target: string, approvedDirectories: Set<string>): boolean {
+  for (const directory of approvedDirectories) {
+    if (isWithin(directory, target)) return true;
+  }
+  return false;
+}
+
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
@@ -179,26 +221,30 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       return { block: true, reason: `Invalid input for ${event.toolName}` };
     }
-    const targets = targetsFor(event.toolName, input);
+    const targets = targetsFor(event.toolName, input, ctx.cwd);
+    const denied = targets.find((target): target is Extract<Target, { kind: "deny" }> => target.kind === "deny");
+    if (denied) return { block: true, reason: denied.reason };
 
     const root = await realpath(ctx.cwd);
-    const external: string[] = [];
+    const approvedDirectories = approvedDirectorySet(root);
+    const external: Array<{ display: string; directory?: string }> = [];
 
     for (const target of targets) {
       if (target.kind === "opaque") {
-        external.push(target.value);
+        external.push({ display: target.value });
         continue;
       }
 
       try {
-        const resolved = await canonicalPath(target.value, ctx.cwd);
-        if (!isWithin(root, resolved)) external.push(resolved);
+        const resolved = await canonicalPath(target.value, target.base ?? ctx.cwd);
+        if (isWithin(root, resolved) || isApproved(resolved, approvedDirectories)) continue;
+        external.push({ display: resolved, directory: await approvalDirectory(resolved) });
       } catch {
-        external.push(`${target.value} (unresolved)`);
+        external.push({ display: `${target.value} (unresolved)` });
       }
     }
 
-    const requested = unique(external);
+    const requested = unique(external.map(({ display }) => display));
     if (requested.length === 0) return;
 
     if (!ctx.hasUI) {
@@ -208,9 +254,15 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
       };
     }
 
+    const rememberedDirectories = unique(
+      external.flatMap(({ directory }) => (directory ? [directory] : [])),
+    );
+    const rememberNotice = rememberedDirectories.length > 0
+      ? `\n\nRemember for this OMP process:\n${rememberedDirectories.map((path) => `- ${path}`).join("\n")}`
+      : "";
     const approved = await ctx.ui.confirm(
       "Allow write outside workspace?",
-      `Workspace: ${root}\n\nTargets:\n${requested.map((path) => `- ${path}`).join("\n")}`,
+      `Workspace: ${root}\n\nTargets:\n${requested.map((path) => `- ${path}`).join("\n")}${rememberNotice}`,
     );
     if (!approved) {
       return {
@@ -218,5 +270,7 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
         reason: `User denied write outside workspace: ${requested.join(", ")}`,
       };
     }
+
+    for (const directory of rememberedDirectories) approvedDirectories.add(directory);
   });
 }
