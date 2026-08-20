@@ -1,6 +1,6 @@
 import { bashWriteTargets } from "./bash-targets.ts";
 import { lstat, readlink, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   basename,
   dirname,
@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 const EDIT_SECTION = /^\[([^\]\r\n]+)#[0-9A-F]{4}\]\s*$/gm;
-const PATCH_FILE = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+)\s*$/gm;
+const PATCH_FILE = /^\*\*\* (Add|Update|Delete) File:\s*(.+)\s*$/gm;
 const PATCH_MOVE = /^\*\*\* Move to:\s*(.+)\s*$/gm;
 const EDIT_MOVE = /^MV\s+(.+?)\s*$/gm;
 const ARCHIVE_OR_DB = /^(.*\.(?:tar\.gz|tgz|tar|zip|jar|war|ear|apk|sqlite|sqlite3|db|db3)):/i;
@@ -25,11 +25,13 @@ const MUTATING_LSP_ACTIONS: Record<string, true> = {
   request: true,
 };
 const approvedDirectoriesByWorkspace = new Map<string, Set<string>>();
+const ownedTemporaryPathsByWorkspace = new Map<string, Set<string>>();
+const pendingTemporaryChecks = new Map<string, { workspace: string; candidates: string[] }>();
 
 type ToolInput = Record<string, unknown>;
 
 type Target =
-  | { kind: "path"; value: string; base?: string }
+  | { kind: "path"; value: string; base?: string; creates?: true }
   | { kind: "opaque"; value: string }
   | { kind: "deny"; reason: string };
 
@@ -44,16 +46,29 @@ function errorCode(error: unknown): string | undefined {
 }
 
 
-function patchPaths(value: unknown): string[] {
+function patchTargets(value: unknown): Target[] {
   if (typeof value !== "string") return [];
 
-  const paths: string[] = [];
-  for (const pattern of [EDIT_SECTION, PATCH_FILE, PATCH_MOVE, EDIT_MOVE]) {
-    pattern.lastIndex = 0;
-    let match: RegExpExecArray | null;
-    while ((match = pattern.exec(value)) !== null) paths.push(match[1].trim());
+  const targets: Target[] = [];
+  EDIT_SECTION.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = EDIT_SECTION.exec(value)) !== null) {
+    targets.push({ kind: "path", value: match[1].trim() });
   }
-  return paths;
+
+  PATCH_FILE.lastIndex = 0;
+  while ((match = PATCH_FILE.exec(value)) !== null) {
+    const target = { kind: "path" as const, value: match[2].trim() };
+    targets.push(match[1] === "Add" ? { ...target, creates: true } : target);
+  }
+
+  for (const pattern of [PATCH_MOVE, EDIT_MOVE]) {
+    pattern.lastIndex = 0;
+    while ((match = pattern.exec(value)) !== null) {
+      targets.push({ kind: "path", value: match[1].trim(), creates: true });
+    }
+  }
+  return targets;
 }
 
 function cleanPath(raw: string): string {
@@ -63,14 +78,15 @@ function cleanPath(raw: string): string {
   return value;
 }
 
-function writeTarget(raw: string): Target | undefined {
+function writeTarget(raw: string, creates = false): Target | undefined {
   const wrapped = raw.match(/^\[(.*)#[0-9A-F]{4}\]$/);
   const value = cleanPath(wrapped?.[1] ?? raw);
 
   if (value.startsWith("xd://") || value.startsWith("local://")) return undefined;
   if (value.startsWith("file://")) {
     try {
-      return { kind: "path", value: fileURLToPath(value) };
+      const target = { kind: "path" as const, value: fileURLToPath(value) };
+      return creates ? { ...target, creates: true } : target;
     } catch {
       return { kind: "opaque", value };
     }
@@ -80,12 +96,13 @@ function writeTarget(raw: string): Target | undefined {
   }
 
   const container = value.match(ARCHIVE_OR_DB)?.[1];
-  return { kind: "path", value: container ?? value };
+  const target = { kind: "path" as const, value: container ?? value };
+  return creates ? { ...target, creates: true } : target;
 }
 
 function targetsFor(toolName: string, input: ToolInput, cwd: string): Target[] {
   if (toolName === "write") {
-    return strings(input.path).map(writeTarget).filter((target): target is Target => target !== undefined);
+    return strings(input.path).map((value) => writeTarget(value, true)).filter((target): target is Target => target !== undefined);
   }
 
   if (toolName === "bash") {
@@ -95,13 +112,15 @@ function targetsFor(toolName: string, input: ToolInput, cwd: string): Target[] {
   }
 
   if (toolName === "edit" || toolName === "apply_patch") {
-    const paths = [
+    const explicit = [
       ...strings(input.path),
       ...strings(input.file),
-      ...patchPaths(input.input),
-      ...patchPaths(input.patch),
+    ].map((value) => ({ kind: "path" as const, value }));
+    return [
+      ...explicit,
+      ...patchTargets(input.input),
+      ...patchTargets(input.patch),
     ];
-    return paths.map((value) => ({ kind: "path", value }));
   }
   if (toolName === "ast_edit") {
     return strings(input.paths).map((value) => ({ kind: "path", value }));
@@ -114,9 +133,11 @@ function targetsFor(toolName: string, input: ToolInput, cwd: string): Target[] {
     if ((action === "rename" || action === "rename_file") && input.apply === false) return [];
     if (action === "request") return [{ kind: "opaque", value: "LSP request" }];
 
-    const paths = strings(input.file);
-    if (action === "rename_file") paths.push(...strings(input.new_name));
-    return paths.map((value) => ({ kind: "path", value }));
+    const paths = strings(input.file).map((value) => ({ kind: "path" as const, value }));
+    if (action === "rename_file") {
+      paths.push(...strings(input.new_name).map((value) => ({ kind: "path" as const, value, creates: true as const })));
+    }
+    return paths;
   }
 
   if (toolName === "delete") {
@@ -124,12 +145,15 @@ function targetsFor(toolName: string, input: ToolInput, cwd: string): Target[] {
   }
 
   if (toolName === "move") {
-    return [
+    const sources = [
       ...strings(input.path),
       ...strings(input.source),
+    ].map((value) => ({ kind: "path" as const, value }));
+    const destinations = [
       ...strings(input.destination),
       ...strings(input.to),
-    ].map((value) => ({ kind: "path", value }));
+    ].map((value) => ({ kind: "path" as const, value, creates: true as const }));
+    return [...sources, ...destinations];
   }
 
   return [];
@@ -207,6 +231,20 @@ function isApproved(target: string, approvedDirectories: Set<string>): boolean {
   }
   return false;
 }
+function ownedTemporaryPathSet(workspace: string): Set<string> {
+  const existing = ownedTemporaryPathsByWorkspace.get(workspace);
+  if (existing) return existing;
+
+  const created = new Set<string>();
+  ownedTemporaryPathsByWorkspace.set(workspace, created);
+  return created;
+}
+
+function temporaryNamespace(temporaryRoot: string, target: string): string | undefined {
+  const rel = relative(temporaryRoot, target);
+  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
+  return join(temporaryRoot, rel.split(sep)[0]);
+}
 
 
 function unique(values: string[]): string[] {
@@ -226,7 +264,11 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     if (denied) return { block: true, reason: denied.reason };
 
     const root = await realpath(ctx.cwd);
+    const temporaryRoot = await realpath(tmpdir());
     const approvedDirectories = approvedDirectorySet(root);
+    const ownedTemporaryPaths = ownedTemporaryPathSet(root);
+    const provisionalTemporaryPaths = new Set<string>();
+    const temporaryCandidates = new Set<string>();
     const external: Array<{ display: string; directory?: string }> = [];
 
     for (const target of targets) {
@@ -237,7 +279,29 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
 
       try {
         const resolved = await canonicalPath(target.value, target.base ?? ctx.cwd);
-        if (isWithin(root, resolved) || isApproved(resolved, approvedDirectories)) continue;
+        if (
+          isWithin(root, resolved) ||
+          isApproved(resolved, approvedDirectories) ||
+          isApproved(resolved, ownedTemporaryPaths) ||
+          isApproved(resolved, provisionalTemporaryPaths)
+        ) {
+          continue;
+        }
+
+        const namespace = target.creates ? temporaryNamespace(temporaryRoot, resolved) : undefined;
+        if (namespace) {
+          try {
+            await lstat(namespace);
+          } catch (error) {
+            if (errorCode(error) === "ENOENT") {
+              provisionalTemporaryPaths.add(namespace);
+              temporaryCandidates.add(namespace);
+              continue;
+            }
+            throw error;
+          }
+        }
+
         external.push({ display: resolved, directory: await approvalDirectory(resolved) });
       } catch {
         external.push({ display: `${target.value} (unresolved)` });
@@ -245,7 +309,15 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     }
 
     const requested = unique(external.map(({ display }) => display));
-    if (requested.length === 0) return;
+    if (requested.length === 0) {
+      if (typeof event.toolCallId === "string" && targets.length > 0) {
+        pendingTemporaryChecks.set(event.toolCallId, {
+          workspace: root,
+          candidates: [...temporaryCandidates],
+        });
+      }
+      return;
+    }
 
     if (!ctx.hasUI) {
       return {
@@ -272,5 +344,35 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     }
 
     for (const directory of rememberedDirectories) approvedDirectories.add(directory);
+    if (typeof event.toolCallId === "string" && targets.length > 0) {
+      pendingTemporaryChecks.set(event.toolCallId, {
+        workspace: root,
+        candidates: [...temporaryCandidates],
+      });
+    }
+  });
+
+  pi.on("tool_result", async (event) => {
+    const pending = pendingTemporaryChecks.get(event.toolCallId);
+    if (!pending) return;
+    pendingTemporaryChecks.delete(event.toolCallId);
+
+    const ownedTemporaryPaths = ownedTemporaryPathSet(pending.workspace);
+    for (const candidate of pending.candidates) {
+      try {
+        await lstat(candidate);
+        ownedTemporaryPaths.add(candidate);
+      } catch {
+        // A failed or self-cleaning operation owns no persistent path.
+      }
+    }
+
+    for (const owned of ownedTemporaryPaths) {
+      try {
+        await lstat(owned);
+      } catch (error) {
+        if (errorCode(error) === "ENOENT") ownedTemporaryPaths.delete(owned);
+      }
+    }
   });
 }

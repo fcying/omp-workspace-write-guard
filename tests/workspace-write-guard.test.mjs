@@ -23,6 +23,22 @@ function registerHandler() {
   assert.deepEqual(labels, ["Workspace write guard"]);
   return handler;
 }
+function registerLifecycleHandlers() {
+  let call;
+  let result;
+
+  workspaceWriteGuard({
+    setLabel() {},
+    on(event, callback) {
+      if (event === "tool_call") call = callback;
+      if (event === "tool_result") result = callback;
+    },
+  });
+
+  assert.equal(typeof call, "function");
+  assert.equal(typeof result, "function");
+  return { call, result };
+}
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), "omp-write-guard-"));
@@ -213,6 +229,8 @@ test("allows common Bash reads, project runners, and workspace writes", async (t
     "touch generated.txt",
     "printf ok > generated.txt",
     "run-tests 2>&1",
+    "git init -b main nested-repo",
+    "git init --initial-branch=main nested-repo-long",
   ];
 
   for (const command of commands) {
@@ -254,6 +272,12 @@ test("blocks explicit Bash writes outside the workspace", async (t) => {
     `printf ok > ${join(outside, "redirect.txt")}`,
     `cd ${outside} && mkdir nested`,
     "git -C ../outside add .",
+    `git init -b main ${join(outside, "init-short")}`,
+    `git init --initial-branch=main ${join(outside, "init-long")}`,
+    `git init --separate-git-dir ${join(outside, "git-data")} local-worktree`,
+    `git clone --depth 1 https://example.invalid/repo ${join(outside, "clone")}`,
+    `git --git-dir ${join(outside, "repo.git")} add .`,
+    `git --git-dir=${join(outside, "repo-inline.git")} add .`,
     `cp source.txt ${join(outside, "copy.txt")}`,
   ];
 
@@ -281,4 +305,57 @@ test("reuses an approved directory for Bash targets", async (t) => {
   assert.equal(approved, undefined);
   assert.equal(cached, undefined);
   assert.equal(prompts.length, 1);
+});
+
+test("owns a newly created temporary namespace for its lifecycle", async (t) => {
+  const { workspace } = await fixture(t);
+  const { call, result } = registerLifecycleHandlers();
+  const temporary = await mkdtemp(join(tmpdir(), "omp-owned-probe-"));
+  await rm(temporary, { recursive: true });
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+
+  const creation = await call(
+    { toolCallId: "create-temp", toolName: "bash", input: { command: `mkdir ${temporary}` } },
+    context(workspace),
+  );
+  await mkdir(temporary);
+  await result({ toolCallId: "create-temp", toolName: "bash", isError: false, content: [] });
+
+  const update = await call(
+    { toolCallId: "update-temp", toolName: "write", input: { path: join(temporary, "file.txt"), content: "ok" } },
+    context(workspace),
+  );
+  const deletion = await call(
+    { toolCallId: "delete-temp", toolName: "bash", input: { command: `rm -rf ${temporary}` } },
+    context(workspace),
+  );
+
+  assert.equal(creation, undefined);
+  assert.equal(update, undefined);
+  assert.equal(deletion, undefined);
+});
+
+test("does not claim existing or unsuccessfully created temporary namespaces", async (t) => {
+  const { workspace, outside } = await fixture(t);
+  const { call, result } = registerLifecycleHandlers();
+  const failed = await mkdtemp(join(tmpdir(), "omp-failed-probe-"));
+  await rm(failed, { recursive: true });
+
+  const existingWrite = await call(
+    { toolCallId: "existing-temp", toolName: "bash", input: { command: `touch ${join(outside, "file.txt")}` } },
+    context(workspace),
+  );
+  const failedCreation = await call(
+    { toolCallId: "failed-temp", toolName: "write", input: { path: join(failed, "file.txt"), content: "no" } },
+    context(workspace),
+  );
+  await result({ toolCallId: "failed-temp", toolName: "write", isError: true, content: [] });
+  const deleteFailed = await call(
+    { toolCallId: "delete-failed", toolName: "bash", input: { command: `rm -rf ${failed}` } },
+    context(workspace),
+  );
+
+  assert.equal(existingWrite.block, true);
+  assert.equal(failedCreation, undefined);
+  assert.equal(deleteFailed.block, true);
 });

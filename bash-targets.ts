@@ -2,7 +2,7 @@ import { basename, isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
 
 export type BashTarget =
-  | { kind: "path"; value: string; base: string }
+  | { kind: "path"; value: string; base: string; creates?: true }
   | { kind: "opaque"; value: string }
   | { kind: "deny"; reason: string };
 
@@ -107,6 +107,49 @@ const GIT_OPTIONS_WITH_VALUE: Record<string, true> = {
   "--super-prefix": true,
   "--work-tree": true,
 };
+const GIT_INIT_OPTIONS_WITH_VALUE: Record<string, true> = {
+  "-b": true,
+  "--initial-branch": true,
+  "--object-format": true,
+  "--ref-format": true,
+  "--separate-git-dir": true,
+  "--template": true,
+};
+const GIT_CLONE_OPTIONS_WITH_VALUE: Record<string, true> = {
+  "-b": true,
+  "--branch": true,
+  "-c": true,
+  "--config": true,
+  "--depth": true,
+  "--filter": true,
+  "-j": true,
+  "--jobs": true,
+  "-o": true,
+  "--origin": true,
+  "--reference": true,
+  "--reference-if-able": true,
+  "--revision": true,
+  "--separate-git-dir": true,
+  "--server-option": true,
+  "--shallow-exclude": true,
+  "--shallow-since": true,
+  "--template": true,
+  "-u": true,
+  "--upload-pack": true,
+};
+const GIT_WORKTREE_ADD_OPTIONS_WITH_VALUE: Record<string, true> = {
+  "-b": true,
+  "-B": true,
+  "--reason": true,
+};
+const GIT_CONFIG_OPTIONS_WITH_VALUE: Record<string, true> = {
+  "-f": true,
+  "--file": true,
+  "--blob": true,
+  "--comment": true,
+  "--default": true,
+  "--type": true,
+};
 
 function tokenize(command: string): Token[] {
   const tokens: Token[] = [];
@@ -182,11 +225,16 @@ function hasDynamicExpansion(value: string): boolean {
   return /[$`]/.test(value);
 }
 
-function pathTarget(value: string, base: string | undefined, label: string): BashTarget {
+function pathTarget(
+  value: string,
+  base: string | undefined,
+  label: string,
+  creates = false,
+): BashTarget {
   if (!base || hasDynamicExpansion(value)) {
     return { kind: "opaque", value: `${label}: ${value}` };
   }
-  return { kind: "path", value, base };
+  return creates ? { kind: "path", value, base, creates: true } : { kind: "path", value, base };
 }
 
 function operands(words: string[]): string[] {
@@ -203,6 +251,48 @@ function operands(words: string[]): string[] {
   }
   return result;
 }
+function positionalArguments(words: string[], optionsWithValue: Record<string, true>): string[] {
+  const result: string[] = [];
+  let options = true;
+
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index];
+    if (options && word === "--") {
+      options = false;
+      continue;
+    }
+    if (!options || !word.startsWith("-") || word === "-") {
+      result.push(word);
+      continue;
+    }
+
+    const option = word.includes("=") ? word.slice(0, word.indexOf("=")) : word;
+    if (Object.hasOwn(optionsWithValue, option) && option === word) {
+      index += 1;
+      continue;
+    }
+    if (word.length > 2 && Object.hasOwn(optionsWithValue, word.slice(0, 2))) continue;
+  }
+
+  return result;
+}
+
+function optionArgument(
+  words: string[],
+  shortName: string | undefined,
+  longName: string,
+): string | undefined {
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index];
+    if (word === longName || (shortName && word === shortName)) return words[index + 1];
+    if (word.startsWith(`${longName}=`)) return word.slice(longName.length + 1);
+    if (shortName && word.startsWith(shortName) && word.length > shortName.length) {
+      return word.slice(shortName.length);
+    }
+  }
+  return undefined;
+}
+
 
 function destinationOperand(words: string[]): string | undefined {
   for (let index = 0; index < words.length; index += 1) {
@@ -239,6 +329,7 @@ function unwrapCommand(words: string[]): string[] {
 
 function gitTargets(args: string[], base: string | undefined): BashTarget[] {
   let gitBase = base;
+  const scopeTargets: BashTarget[] = [];
   let index = 0;
 
   while (index < args.length) {
@@ -265,8 +356,20 @@ function gitTargets(args: string[], base: string | undefined): BashTarget[] {
       index += 1;
       continue;
     }
-    if (Object.hasOwn(GIT_OPTIONS_WITH_VALUE, word)) {
-      index += 2;
+
+    const optionName = word.includes("=") ? word.slice(0, word.indexOf("=")) : word;
+    if (Object.hasOwn(GIT_OPTIONS_WITH_VALUE, optionName)) {
+      const optionValue = optionName === word
+        ? args[index + 1]
+        : word.slice(optionName.length + 1);
+      if ((optionName === "--git-dir" || optionName === "--work-tree") && optionValue) {
+        scopeTargets.push(pathTarget(optionValue, gitBase, `git ${optionName}`));
+      }
+      index += optionName === word ? 2 : 1;
+      continue;
+    }
+    if (word.length > 2 && Object.hasOwn(GIT_OPTIONS_WITH_VALUE, word.slice(0, 2))) {
+      index += 1;
       continue;
     }
     if (word.startsWith("-")) {
@@ -276,7 +379,6 @@ function gitTargets(args: string[], base: string | undefined): BashTarget[] {
     break;
   }
 
-
   const subcommand = args[index];
   if (subcommand === "push") {
     return [{ kind: "deny", reason: "git push is blocked by workspace write guard" }];
@@ -285,45 +387,67 @@ function gitTargets(args: string[], base: string | undefined): BashTarget[] {
   const subcommandArgs = args.slice(index + 1);
 
   if (subcommand === "clone") {
-    const values = operands(subcommandArgs);
-    const destination = values.length >= 2 ? values.at(-1) : ".";
-    return destination ? [pathTarget(destination, gitBase, "git clone destination")] : [];
+    const values = positionalArguments(subcommandArgs, GIT_CLONE_OPTIONS_WITH_VALUE);
+    if (values.length === 0) return scopeTargets;
+    const separateGitDir = optionArgument(subcommandArgs, undefined, "--separate-git-dir");
+    const destination = values[1] ?? ".";
+    const targets = separateGitDir
+      ? [pathTarget(separateGitDir, gitBase, "git clone separate git directory", true)]
+      : [];
+    return [...scopeTargets, ...targets, pathTarget(destination, gitBase, "git clone destination", true)];
   }
   if (subcommand === "init") {
-    const destination = operands(subcommandArgs)[0] ?? ".";
-    return [pathTarget(destination, gitBase, "git init destination")];
+    const separateGitDir = optionArgument(subcommandArgs, undefined, "--separate-git-dir");
+    const destination = positionalArguments(subcommandArgs, GIT_INIT_OPTIONS_WITH_VALUE)[0] ?? ".";
+    const targets = separateGitDir
+      ? [pathTarget(separateGitDir, gitBase, "git init separate git directory", true)]
+      : [];
+    const scopedTargets = scopeTargets.map((target) =>
+      target.kind === "path" ? { ...target, creates: true as const } : target
+    );
+    return [...scopedTargets, ...targets, pathTarget(destination, gitBase, "git init destination", true)];
   }
   if (subcommand === "worktree") {
-    const [action, ...values] = operands(subcommandArgs);
-    const targetCount = action === "move" ? 2 : action === "add" || action === "remove" ? 1 : 0;
-    if (targetCount > 0) {
-      return values
-        .slice(0, targetCount)
-        .map((value) => pathTarget(value, gitBase, `git worktree ${action}`));
+    const actionIndex = subcommandArgs.findIndex((value) => /^(?:add|move|remove)$/.test(value));
+    if (actionIndex >= 0) {
+      const action = subcommandArgs[actionIndex];
+      const actionArgs = subcommandArgs.slice(actionIndex + 1);
+      const values = action === "add"
+        ? positionalArguments(actionArgs, GIT_WORKTREE_ADD_OPTIONS_WITH_VALUE)
+        : positionalArguments(actionArgs, {});
+      const targetCount = action === "move" ? 2 : 1;
+      return [
+        ...scopeTargets,
+        ...values
+          .slice(0, targetCount)
+          .map((value, valueIndex) => pathTarget(
+            value,
+            gitBase,
+            `git worktree ${action}`,
+            action === "add" || (action === "move" && valueIndex === 1),
+          )),
+      ];
     }
   }
   if (subcommand === "config") {
-    const values = operands(subcommandArgs);
+    const values = positionalArguments(subcommandArgs, GIT_CONFIG_OPTIONS_WITH_VALUE);
     const mutatingFlag = subcommandArgs.some((value) =>
       /^(?:--add|--replace-all|--unset|--unset-all|--rename-section|--remove-section)$/.test(value),
     );
     if (!mutatingFlag && values.length < 2) return [];
 
-    const fileIndex = subcommandArgs.findIndex((value) => value === "--file" || value === "-f");
-    const fileArgument = fileIndex >= 0 ? subcommandArgs[fileIndex + 1] : undefined;
-    const inlineFile = subcommandArgs.find((value) => value.startsWith("--file="))?.slice("--file=".length);
-    if (fileArgument || inlineFile) {
-      return [pathTarget(fileArgument ?? inlineFile ?? "", gitBase, "git config file")];
-    }
+    const configFile = optionArgument(subcommandArgs, "-f", "--file");
+    if (configFile) return [...scopeTargets, pathTarget(configFile, gitBase, "git config file", true)];
     if (subcommandArgs.includes("--global")) {
-      return [pathTarget(resolve(homedir(), ".gitconfig"), gitBase, "git config global")];
+      return [...scopeTargets, pathTarget(resolve(homedir(), ".gitconfig"), gitBase, "git config global")];
     }
     if (subcommandArgs.includes("--system")) {
-      return [pathTarget("/etc/gitconfig", gitBase, "git config system")];
+      return [...scopeTargets, pathTarget("/etc/gitconfig", gitBase, "git config system")];
     }
   }
 
-  return [pathTarget(".", gitBase, `git ${subcommand} working directory`)];
+
+  return [...scopeTargets, pathTarget(".", gitBase, `git ${subcommand} working directory`)];
 }
 
 function commandTargets(words: string[], base: string | undefined): BashTarget[] {
@@ -335,25 +459,28 @@ function commandTargets(words: string[], base: string | undefined): BashTarget[]
   const argsWithoutOptions = operands(args);
 
   if (Object.hasOwn(DIRECT_MUTATORS, command)) {
-    return argsWithoutOptions.map((value) => pathTarget(value, base, command));
+    const creates = command === "mkdir" || command === "touch" || command === "truncate";
+    return argsWithoutOptions.map((value) => pathTarget(value, base, command, creates));
   }
   if (Object.hasOwn(METADATA_MUTATORS, command)) {
     return argsWithoutOptions.slice(1).map((value) => pathTarget(value, base, command));
   }
   if (command === "mv") {
-    return argsWithoutOptions.map((value) => pathTarget(value, base, command));
+    return argsWithoutOptions.map((value, index) =>
+      pathTarget(value, base, command, index === argsWithoutOptions.length - 1)
+    );
   }
   if (Object.hasOwn(DESTINATION_MUTATORS, command)) {
     const destination = destinationOperand(args);
-    return destination ? [pathTarget(destination, base, `${command} destination`)] : [];
+    return destination ? [pathTarget(destination, base, `${command} destination`, true)] : [];
   }
   if (command === "tee") {
-    return argsWithoutOptions.map((value) => pathTarget(value, base, command));
+    return argsWithoutOptions.map((value) => pathTarget(value, base, command, true));
   }
   if (command === "dd") {
     return args
       .filter((value) => value.startsWith("of="))
-      .map((value) => pathTarget(value.slice(3), base, "dd output"));
+      .map((value) => pathTarget(value.slice(3), base, "dd output", true));
   }
   if ((command === "sed" || command === "perl") && args.some((value) => /^-.*i/.test(value))) {
     const files = argsWithoutOptions.slice(1);
@@ -379,7 +506,7 @@ function processSegment(tokens: Token[], base: string | undefined): { targets: B
         }
         const duplicatesDescriptor = token.value === ">&" && /^(?:[0-9]+|-)$/.test(target.value);
         if (Object.hasOwn(WRITE_REDIRECTS, token.value) && !duplicatesDescriptor) {
-          targets.push(pathTarget(target.value, base, "shell redirection"));
+          targets.push(pathTarget(target.value, base, "shell redirection", true));
         }
         index += 1;
       }

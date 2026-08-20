@@ -11,11 +11,13 @@ Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `e
 - Approvals reset when OMP restarts and are not shared across different workspaces.
 - External writes are denied when no interactive UI is available and the directory has not already been approved.
 - Symbolic links are resolved before checking or remembering a directory.
+- Reads under `/tmp` are allowed like all other reads. A new top-level `/tmp/<name>` namespace may be created without confirmation; after successful creation, that namespace and its descendants may be modified or deleted by the same OMP process and workspace.
+- Existing `/tmp` namespaces are not claimed automatically. Temporary ownership resets when OMP restarts and is not shared across workspaces.
 - Common explicit Bash writes are checked when Bash is configured for automatic approval.
 
 ## Recommended low-prompt configuration
 
-Keep the normal `write` approval mode, but auto-approve Bash:
+Keep the normal `write` approval mode and auto-approve Bash:
 
 ```bash
 omp config set tools.approvalMode write
@@ -30,8 +32,7 @@ just test
 npm test
 cargo build
 ```
-
-OMP's critical destructive-command guard may still force a prompt. Other executable tools such as `eval`, `task`, and `browser` retain OMP's normal approval behavior.
+OMP's critical destructive-command guard still requires confirmation for recursive commands such as `rm -r` and `rm -rf`. To remove an owned temporary tree without another prompt, delete its files with non-recursive `rm` calls and then remove empty directories with `rmdir`.
 
 Do not use `yolo` unless you accept that arbitrary executable tools can bypass path checks.
 
@@ -63,7 +64,7 @@ The plugin intercepts:
 - LSP modification operations
 - Common Bash commands with explicit write targets
 
-Bash checks cover shell output redirection, `rm`, `rmdir`, `mkdir`, `touch`, `truncate`, `cp`, `mv`, `install`, `ln`, `chmod`, `chown`, `chgrp`, `tee`, `dd of=`, in-place `sed`/`perl`, and mutating Git commands. Structured Bash `cwd`, `cd`, Git `-C`, globs, home paths, and symbolic links are resolved before comparison.
+Bash checks cover shell output redirection, `rm`, `rmdir`, `mkdir`, `touch`, `truncate`, `cp`, `mv`, `install`, `ln`, `chmod`, `chown`, `chgrp`, `tee`, `dd of=`, in-place `sed`/`perl`, and mutating Git commands. Structured Bash `cwd`, `cd`, Git `-C`, globs, home paths, and symbolic links are resolved before comparison. Creating a previously absent top-level namespace under `/tmp` grants process-local ownership only after the tool result confirms that namespace now exists.
 
 `git push` is always blocked immediately, including wrapped, `git -C`, and compound-command forms. It never opens an approval dialog and cannot be remembered or allowed for the process.
 
@@ -87,4 +88,4 @@ Node.js 22.18 or later:
 npm test
 ```
 
-Tests cover workspace and external writes, remembered directory approval, symbolic-link escapes, AST and LSP edits, Bash redirection, Git commands, `cwd`/`cd`, and common file mutation commands.
+Tests cover workspace and external writes, temporary namespace ownership, remembered directory approval, symbolic-link escapes, AST and LSP edits, Bash redirection, Git commands, `cwd`/`cd`, and common file mutation commands.
