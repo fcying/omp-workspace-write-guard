@@ -1,0 +1,27 @@
+{
+  "name": "omp-workspace-write-guard",
+  "version": "0.1.0",
+  "description": "Prompt before OMP writes outside the current workspace.",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/workspace-write-guard.test.mjs"
+  },
+  "keywords": [
+    "oh-my-pi",
+    "omp",
+    "security",
+    "workspace"
+  ],
+  "omp": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
