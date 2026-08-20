@@ -10,17 +10,18 @@ This plugin provides low-prompt workspace write protection for OMP:
 
 - Reads from any location are allowed.
 - Direct file modifications inside the current workspace are allowed.
-- Direct modifications outside the workspace require user confirmation.
-- After approval, the real parent directory is remembered only for the current OMP process and workspace.
+- Direct modifications outside the workspace follow the configured `externalWrites` policy.
+- After interactive approval, the real parent directory is remembered only for the current OMP process and workspace.
 - An unapproved external modification is denied when no interactive UI is available.
-- `git push` is always denied without opening an approval dialog or consulting the directory approval cache.
+- `git push` follows its independent configured policy and defaults to denial.
 
 This plugin is an accidental-write guard, not an operating-system sandbox. Never claim that it can statically prove the filesystem side effects of arbitrary scripts, task runners, or programs.
 
 ## Repository Structure
 
-- `index.ts`: OMP extension entry point, path normalization, symbolic-link resolution, directory approval cache, and confirmation flow.
-- `bash-targets.ts`: explicit Bash write-target detection and the unconditional `git push` denial rule.
+- `index.ts`: OMP extension entry point, path normalization, symbolic-link resolution, configured policy enforcement, directory approval cache, and confirmation flow.
+- `bash-targets.ts`: explicit Bash write-target and `git push` detection.
+- `config.ts` and `workspace-write-guard.json`: layered configuration loading, validation, and defaults.
 - `tests/workspace-write-guard.test.mjs`: observable permission behavior tests.
 - `README.md`: installation, configuration, supported behavior, and security boundaries.
 - `package.json`: OMP plugin manifest and package version.
@@ -37,7 +38,7 @@ This plugin is an accidental-write guard, not an operating-system sandbox. Never
 - Treat `local://` and `xd://` as OMP internal resources rather than ordinary external filesystem paths.
 - Continue to confirm arbitrary LSP `request` calls. Known rename and code-action operations wholly inside the workspace should not create extra prompts.
 - Bash parsing protects only explicit write targets visible in the command line. Any coverage change must preserve an accurate security-boundary section in `README.md`.
-- Deny direct, wrapped, `git -C`, Git-global-option, and compound-command forms of `git push`.
+- Detect direct, wrapped, `git -C`, Git-global-option, and compound-command forms of `git push`; apply the configured policy without bypassing external repository checks.
 - Do not add compatibility aliases, deprecated entry points, speculative features, or unnecessary abstractions. Keep the implementation conservative and auditable.
 
 ## Verification
@@ -61,7 +62,7 @@ New or changed permission rules require behavioral tests that fail under a plaus
 - Fail-closed behavior without a UI.
 - Common read-only Bash commands and project runners not being falsely blocked.
 - Explicit Bash writes outside the workspace being denied.
-- Every supported `git push` form being denied without a prompt.
+- Every supported `git push` form following the configured policy without prompts under the default denial policy.
 
 Tests must not contact real remotes, perform a real push, or modify persistent files outside the repository. Use temporary directories and Git repositories without remotes.
 

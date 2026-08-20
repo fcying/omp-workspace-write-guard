@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import workspaceWriteGuard from "../index.ts";
 
-function registerHandler() {
+
+function registerHandler(agentDir = join(tmpdir(), `omp-write-guard-test-agent-${process.pid}`)) {
   let handler;
   const labels = [];
 
   workspaceWriteGuard({
+    pi: { getAgentDir: () => agentDir },
     setLabel(label) {
       labels.push(label);
     },
@@ -23,11 +25,12 @@ function registerHandler() {
   assert.deepEqual(labels, ["Workspace write guard"]);
   return handler;
 }
-function registerLifecycleHandlers() {
+function registerLifecycleHandlers(agentDir = join(tmpdir(), `omp-write-guard-test-agent-${process.pid}`)) {
   let call;
   let result;
 
   workspaceWriteGuard({
+    pi: { getAgentDir: () => agentDir },
     setLabel() {},
     on(event, callback) {
       if (event === "tool_call") call = callback;
@@ -44,11 +47,18 @@ async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), "omp-write-guard-"));
   const workspace = join(root, "workspace");
   const outside = join(root, "outside");
+  const agentDir = join(root, "agent");
   await mkdir(workspace);
   await mkdir(outside);
+  await mkdir(agentDir);
   await symlink(outside, join(workspace, "external-link"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  return { workspace, outside };
+  return { root, workspace, outside, agentDir };
+}
+
+async function writeConfig(directory, values) {
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, "workspace-write-guard.json"), `${JSON.stringify(values, null, 2)}\n`);
 }
 
 function context(cwd, { hasUI = false, approve = false, prompts = [] } = {}) {
@@ -239,6 +249,140 @@ test("allows common Bash reads, project runners, and workspace writes", async (t
   }
 });
 
+test("applies allowPaths, denyPaths, and externalWrites precedence", async (t) => {
+  const { root, workspace, outside, agentDir } = await fixture(t);
+  const other = join(root, "other");
+  const protectedExternal = join(outside, "protected");
+  const protectedWorkspace = join(workspace, "protected");
+  await mkdir(other);
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "deny",
+    allowPaths: [outside],
+    denyPaths: [protectedExternal, protectedWorkspace],
+  });
+  const handler = registerHandler(agentDir);
+
+  const allowed = await handler(
+    { toolName: "write", input: { path: join(outside, "allowed.txt"), content: "ok" } },
+    context(workspace),
+  );
+  const deniedExternal = await handler(
+    { toolName: "write", input: { path: join(protectedExternal, "blocked.txt"), content: "no" } },
+    context(workspace, { hasUI: true, approve: true }),
+  );
+  const deniedWorkspace = await handler(
+    { toolName: "write", input: { path: join(protectedWorkspace, "blocked.txt"), content: "no" } },
+    context(workspace, { hasUI: true, approve: true }),
+  );
+  const deniedUnlisted = await handler(
+    { toolName: "write", input: { path: join(other, "blocked.txt"), content: "no" } },
+    context(workspace, { hasUI: true, approve: true }),
+  );
+
+  assert.equal(allowed, undefined);
+  assert.match(deniedExternal.reason, /denied by workspace write guard configuration/);
+  assert.match(deniedWorkspace.reason, /denied by workspace write guard configuration/);
+  assert.match(deniedUnlisted.reason, /denied by configuration/);
+});
+
+test("merges user and project configuration with project settings last", async (t) => {
+  const { workspace, outside, agentDir } = await fixture(t);
+  await writeConfig(agentDir, {
+    externalWrites: "deny",
+    temporary: { allowOwned: false },
+  });
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "allow",
+    temporary: { allowOwned: true },
+  });
+  const handler = registerHandler(agentDir);
+
+  const result = await handler(
+    { toolName: "write", input: { path: join(outside, "allowed.txt"), content: "ok" } },
+    context(workspace),
+  );
+
+  assert.equal(result, undefined);
+});
+
+test("fails closed on invalid configuration without blocking read-only tools", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { externalWrites: "sometimes" });
+  const handler = registerHandler(agentDir);
+
+  const read = await handler(
+    { toolName: "lsp", input: { action: "references", file: "src/file.ts" } },
+    context(workspace),
+  );
+  const write = await handler(
+    { toolName: "write", input: { path: "src/file.ts", content: "no" } },
+    context(workspace),
+  );
+
+  assert.equal(read, undefined);
+  assert.equal(write.block, true);
+  assert.match(write.reason, /configuration error/);
+  assert.match(write.reason, /externalWrites must be allow, deny, or prompt/);
+});
+
+test("prompts for git push when configured", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { gitPush: "prompt" });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+
+  const headless = await handler(
+    { toolName: "bash", input: { command: "git push" } },
+    context(workspace),
+  );
+  const approved = await handler(
+    { toolName: "bash", input: { command: "git push" } },
+    context(workspace, { hasUI: true, approve: true, prompts }),
+  );
+
+  assert.equal(headless.block, true);
+  assert.match(headless.reason, /blocked without interactive approval: git push/);
+  assert.equal(approved, undefined);
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0].body, /git push/);
+});
+
+test("allows configured git push but still guards its external repository", async (t) => {
+  const { workspace, outside, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { gitPush: "allow" });
+  const handler = registerHandler(agentDir);
+
+  const local = await handler(
+    { toolName: "bash", input: { command: "git push" } },
+    context(workspace),
+  );
+  const external = await handler(
+    { toolName: "bash", input: { command: `git -C ${outside} push` } },
+    context(workspace),
+  );
+
+  assert.equal(local, undefined);
+  assert.equal(external.block, true);
+  assert.match(external.reason, /outside/);
+});
+
+test("disables automatic temporary ownership when configured", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  const temporary = await mkdtemp(join(tmpdir(), "omp-configured-temp-"));
+  await rm(temporary, { recursive: true });
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+  await writeConfig(join(workspace, ".omp"), { temporary: { allowOwned: false } });
+  const handler = registerHandler(agentDir);
+
+  const result = await handler(
+    { toolName: "write", input: { path: join(temporary, "file.txt"), content: "no" } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /Write outside workspace blocked/);
+});
+
 test("hard-blocks git push without prompting", async (t) => {
   const { workspace } = await fixture(t);
   const handler = registerHandler();
@@ -259,7 +403,7 @@ test("hard-blocks git push without prompting", async (t) => {
       context(workspace, { hasUI: true, approve: true, prompts }),
     );
     assert.equal(result.block, true, command);
-    assert.equal(result.reason, "git push is blocked by workspace write guard", command);
+    assert.equal(result.reason, "git push is blocked by workspace write guard configuration", command);
   }
   assert.equal(prompts.length, 0);
 });

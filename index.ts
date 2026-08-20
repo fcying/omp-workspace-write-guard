@@ -1,6 +1,7 @@
+import { loadGuardConfig, type GuardConfig } from "./config.ts";
 import { bashWriteTargets } from "./bash-targets.ts";
 import { lstat, readlink, realpath } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import {
   basename,
   dirname,
@@ -27,13 +28,21 @@ const MUTATING_LSP_ACTIONS: Record<string, true> = {
 const approvedDirectoriesByWorkspace = new Map<string, Set<string>>();
 const ownedTemporaryPathsByWorkspace = new Map<string, Set<string>>();
 const pendingTemporaryChecks = new Map<string, { workspace: string; candidates: string[] }>();
+const resolvedConfigs = new Map<string, Promise<ResolvedGuardConfig>>();
 
 type ToolInput = Record<string, unknown>;
 
 type Target =
   | { kind: "path"; value: string; base?: string; creates?: true }
   | { kind: "opaque"; value: string }
-  | { kind: "deny"; reason: string };
+  | { kind: "git-push" };
+
+interface ResolvedGuardConfig {
+  values: GuardConfig;
+  allowPaths: string[];
+  denyPaths: string[];
+  temporaryRoot: string;
+}
 
 function strings(value: unknown): string[] {
   if (typeof value === "string") return [value];
@@ -251,35 +260,80 @@ function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
+async function resolveGuardConfig(agentDir: string, workspace: string): Promise<ResolvedGuardConfig> {
+  const values = await loadGuardConfig(agentDir, workspace);
+  const allowPaths = await Promise.all(values.allowPaths.map((path) => canonicalPath(path, workspace)));
+  const denyPaths = await Promise.all(values.denyPaths.map((path) => canonicalPath(path, workspace)));
+  const temporaryRoot = await canonicalPath(values.temporary.root, workspace);
+  return { values, allowPaths, denyPaths, temporaryRoot };
+}
+
+function overlapsConfiguredPath(target: string, configuredPaths: string[]): boolean {
+  return configuredPaths.some((path) => isWithin(path, target) || isWithin(target, path));
+}
+
+function isAllowedByConfig(target: string, allowPaths: string[]): boolean {
+  return allowPaths.some((path) => isWithin(path, target));
+}
+
 export default function workspaceWriteGuard(pi: ExtensionAPI): void {
   pi.setLabel("Workspace write guard");
+  const agentDir = pi.pi.getAgentDir();
 
   pi.on("tool_call", async (event, ctx) => {
     const input = event.input;
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       return { block: true, reason: `Invalid input for ${event.toolName}` };
     }
-    const targets = targetsFor(event.toolName, input, ctx.cwd);
-    const denied = targets.find((target): target is Extract<Target, { kind: "deny" }> => target.kind === "deny");
-    if (denied) return { block: true, reason: denied.reason };
 
-    const root = await realpath(ctx.cwd);
-    const temporaryRoot = await realpath(tmpdir());
+    const targets = targetsFor(event.toolName, input, ctx.cwd);
+    if (targets.length === 0) return;
+
+    let root: string;
+    let config: ResolvedGuardConfig;
+    try {
+      root = await realpath(ctx.cwd);
+      const key = `${agentDir}\0${root}`;
+      let pending = resolvedConfigs.get(key);
+      if (!pending) {
+        pending = resolveGuardConfig(agentDir, root);
+        resolvedConfigs.set(key, pending);
+      }
+      config = await pending;
+    } catch (error) {
+      return {
+        block: true,
+        reason: `Workspace write guard configuration error: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+
+
+    const gitPush = targets.some((target) => target.kind === "git-push");
+    if (gitPush && config.values.gitPush === "deny") {
+      return { block: true, reason: "git push is blocked by workspace write guard configuration" };
+    }
+
     const approvedDirectories = approvedDirectorySet(root);
     const ownedTemporaryPaths = ownedTemporaryPathSet(root);
     const provisionalTemporaryPaths = new Set<string>();
     const temporaryCandidates = new Set<string>();
     const external: Array<{ display: string; directory?: string }> = [];
+    const commandRequests = gitPush && config.values.gitPush === "prompt" ? ["git push"] : [];
 
     for (const target of targets) {
+      if (target.kind === "git-push") continue;
       if (target.kind === "opaque") {
-        external.push({ display: target.value });
+        if (config.values.externalWrites !== "allow") external.push({ display: target.value });
         continue;
       }
 
       try {
         const resolved = await canonicalPath(target.value, target.base ?? ctx.cwd);
+        if (overlapsConfiguredPath(resolved, config.denyPaths)) {
+          return { block: true, reason: `Write denied by workspace write guard configuration: ${resolved}` };
+        }
         if (
+          isAllowedByConfig(resolved, config.allowPaths) ||
           isWithin(root, resolved) ||
           isApproved(resolved, approvedDirectories) ||
           isApproved(resolved, ownedTemporaryPaths) ||
@@ -288,7 +342,9 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
           continue;
         }
 
-        const namespace = target.creates ? temporaryNamespace(temporaryRoot, resolved) : undefined;
+        const namespace = config.values.temporary.allowOwned && target.creates
+          ? temporaryNamespace(config.temporaryRoot, resolved)
+          : undefined;
         if (namespace) {
           try {
             await lstat(namespace);
@@ -302,13 +358,28 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
           }
         }
 
-        external.push({ display: resolved, directory: await approvalDirectory(resolved) });
-      } catch {
-        external.push({ display: `${target.value} (unresolved)` });
+        if (config.values.externalWrites !== "allow") {
+          external.push({ display: resolved, directory: await approvalDirectory(resolved) });
+        }
+      } catch (error) {
+        if (config.denyPaths.length > 0) {
+          return {
+            block: true,
+            reason: `Cannot verify path against workspace write guard denyPaths: ${target.value}`,
+          };
+        }
+        if (config.values.externalWrites !== "allow") {
+          external.push({
+            display: error instanceof Error ? `${target.value} (${error.message})` : `${target.value} (unresolved)`,
+          });
+        }
       }
     }
 
-    const requested = unique(external.map(({ display }) => display));
+    const requested = unique([
+      ...commandRequests,
+      ...external.map(({ display }) => display),
+    ]);
     if (requested.length === 0) {
       if (typeof event.toolCallId === "string" && targets.length > 0) {
         pendingTemporaryChecks.set(event.toolCallId, {
@@ -319,11 +390,12 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
       return;
     }
 
-    if (!ctx.hasUI) {
-      return {
-        block: true,
-        reason: `Write outside workspace blocked without interactive approval: ${requested.join(", ")}`,
-      };
+    if ((external.length > 0 && config.values.externalWrites === "deny") || !ctx.hasUI) {
+      if (external.length > 0 && config.values.externalWrites === "deny") {
+        return { block: true, reason: `Write outside workspace denied by configuration: ${requested.join(", ")}` };
+      }
+      const subject = commandRequests.length > 0 ? "Operation outside workspace" : "Write outside workspace";
+      return { block: true, reason: `${subject} blocked without interactive approval: ${requested.join(", ")}` };
     }
 
     const rememberedDirectories = unique(
@@ -333,13 +405,14 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
       ? `\n\nRemember for this OMP process:\n${rememberedDirectories.map((path) => `- ${path}`).join("\n")}`
       : "";
     const approved = await ctx.ui.confirm(
-      "Allow write outside workspace?",
+      commandRequests.length > 0 ? "Allow operation outside workspace?" : "Allow write outside workspace?",
       `Workspace: ${root}\n\nTargets:\n${requested.map((path) => `- ${path}`).join("\n")}${rememberNotice}`,
     );
     if (!approved) {
+      const subject = commandRequests.length > 0 ? "operation outside workspace" : "write outside workspace";
       return {
         block: true,
-        reason: `User denied write outside workspace: ${requested.join(", ")}`,
+        reason: `User denied ${subject}: ${requested.join(", ")}`,
       };
     }
 

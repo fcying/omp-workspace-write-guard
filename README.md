@@ -1,30 +1,82 @@
 # OMP Workspace Write Guard
 
-Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `external_directory` permission.
+为 Oh My Pi 提供低打扰的工作区写入保护, 行为类似 OpenCode 的 `external_directory` 权限。
 
-## Behavior
+## 行为
 
-- Reads anywhere are allowed automatically.
-- Direct file modifications inside the current workspace are allowed automatically.
-- Direct file modifications outside the workspace require interactive confirmation.
-- Approving an external target remembers its real parent directory for the current OMP process and workspace. Later writes in that directory or its descendants do not prompt again.
-- Approvals reset when OMP restarts and are not shared across different workspaces.
-- External writes are denied when no interactive UI is available and the directory has not already been approved.
-- Symbolic links are resolved before checking or remembering a directory.
-- Reads under `/tmp` are allowed like all other reads. A new top-level `/tmp/<name>` namespace may be created without confirmation; after successful creation, that namespace and its descendants may be modified or deleted by the same OMP process and workspace.
-- Existing `/tmp` namespaces are not claimed automatically. Temporary ownership resets when OMP restarts and is not shared across workspaces.
-- Common explicit Bash writes are checked when Bash is configured for automatic approval.
+- 任意位置的读取默认允许。
+- 当前工作区内的直接文件修改默认允许。
+- 工作区外的直接修改按 `externalWrites` 策略处理, 默认要求交互确认。
+- 外部目标通过确认后, 插件只在当前 OMP 进程和当前工作区内记住其真实父目录。后续写入该目录及其子目录不再提示。
+- OMP 重启后清空目录授权; 不同工作区之间不共享授权。
+- 没有交互 UI 时, 需要确认但尚未授权的外部写入会被拒绝。
+- 检查和记录目录前会解析符号链接。
+- 新建临时命名空间可按 `temporary` 规则自动获得当前进程的临时所有权。默认允许新建 `/tmp/<name>`; 工具成功创建后, 同一进程和工作区可以修改或删除该命名空间。
+- 既有临时命名空间不会被自动认领。临时所有权在 OMP 重启后清空, 也不会跨工作区共享。
+- Bash 自动审批开启时, 插件仍检查命令行中可识别的显式写入目标。
+- `git push` 使用独立策略, 默认直接拒绝。
 
-## Recommended low-prompt configuration
+## 自定义配置
 
-Keep the normal `write` approval mode and auto-approve Bash:
+插件按以下顺序加载 `workspace-write-guard.json`, 后加载的配置覆盖先加载的配置:
+
+1. 插件包内默认配置。
+2. 当前 OMP profile 的 agent 配置目录。默认 profile 通常是 `~/.omp/agent/workspace-write-guard.json`。
+3. 当前工作区的 `<workspace>/.omp/workspace-write-guard.json`。
+
+普通字段逐字段覆盖; `allowPaths` 和 `denyPaths` 数组整体替换; `temporary` 按子字段合并。相对路径以当前工作区为基准, `~` 会展开为用户主目录。不支持 glob。配置在当前 OMP 进程首次执行受保护操作时加载并缓存, 修改后需要重启 OMP。
+
+默认配置:
+
+```json
+{
+  "externalWrites": "prompt",
+  "allowPaths": [],
+  "denyPaths": [],
+  "temporary": {
+    "root": "/tmp",
+    "allowOwned": true
+  },
+  "gitPush": "deny"
+}
+```
+
+字段含义:
+
+- `externalWrites`: `"prompt"`, `"deny"`, `"allow"`。控制未被其他规则匹配的外部写入。
+- `allowPaths`: 自动允许写入的目录或文件路径。只允许该路径及其后代。
+- `denyPaths`: 无条件拒绝写入的目录或文件路径, 优先级高于工作区、`allowPaths` 和会话授权。会影响目标本身、目标后代, 以及可能包含该路径的父目录删除或移动操作。
+- `temporary.root`: 可自动认领新命名空间的临时根目录。
+- `temporary.allowOwned`: 是否启用临时命名空间自动认领。
+- `gitPush`: `"deny"`, `"prompt"`, `"allow"`。即使设为 `"allow"`, `git -C` 或 `--git-dir` 指向外部仓库时仍会执行外部路径检查。
+
+例如, 禁止修改密钥目录, 自动允许一个共享构建目录, 禁用临时目录自动认领, 并让 `git push` 每次确认:
+
+```json
+{
+  "allowPaths": ["~/shared-build"],
+  "denyPaths": ["~/.ssh", "./secrets"],
+  "temporary": {
+    "allowOwned": false
+  },
+  "gitPush": "prompt"
+}
+```
+
+项目配置最后加载, 因此可以放宽用户配置。只对可信仓库启用项目级配置; 不可信仓库应使用用户级配置并检查项目中的 `.omp/workspace-write-guard.json`。
+
+配置包含未知字段、非法枚举、空路径或 glob 时, 插件会安全拒绝受保护操作并返回具体配置错误。纯读取工具不受非法写入配置影响。
+
+## 推荐的低打扰配置
+
+保留 OMP 的普通 `write` 审批模式, 仅自动批准 Bash:
 
 ```bash
 omp config set tools.approvalMode write
 omp config set tools.approval '{"bash":"allow"}'
 ```
 
-This removes approval prompts for commands such as:
+这样不会为以下只读命令或项目 runner 额外提示:
 
 ```bash
 git rev-parse HEAD
@@ -32,11 +84,12 @@ just test
 npm test
 cargo build
 ```
-OMP's critical destructive-command guard still requires confirmation for recursive commands such as `rm -r` and `rm -rf`. To remove an owned temporary tree without another prompt, delete its files with non-recursive `rm` calls and then remove empty directories with `rmdir`.
 
-Do not use `yolo` unless you accept that arbitrary executable tools can bypass path checks.
+OMP 自身的高风险破坏命令保护仍可能要求确认, 例如 `rm -r` 和 `rm -rf`。若要无额外提示地删除插件已认领的临时目录, 可先用非递归 `rm` 删除文件, 再用 `rmdir` 删除空目录。
 
-## Install
+不要使用 `yolo`, 除非你接受任意可执行工具绕过路径检查的风险。
+
+## 安装
 
 ```bash
 omp plugin install https://github.com/fcying/omp-workspace-write-guard
@@ -44,48 +97,48 @@ omp config set tools.approvalMode write
 omp config set tools.approval '{"bash":"allow"}'
 ```
 
-Restart OMP after installing or updating. A new process also loads the plugin when restoring an old session, unless it uses `--no-extensions`, another profile, or another `PI_CODING_AGENT_DIR`.
+安装或更新后重启 OMP。新进程恢复旧会话时也会加载插件, 除非使用 `--no-extensions`、其他 profile 或其他 agent 配置目录。
 
-For local development:
+本地开发:
 
 ```bash
 omp plugin link /path/to/workspace-write-guard
 ```
 
-## Covered modification paths
+## 覆盖的修改路径
 
-The plugin intercepts:
+插件拦截:
 
 - `write`
 - `edit` / `apply_patch`
 - `ast_edit`
 - `delete`
 - `move`
-- LSP modification operations
-- Common Bash commands with explicit write targets
+- LSP 修改操作
+- 带显式写入目标的常见 Bash 命令
 
-Bash checks cover shell output redirection, `rm`, `rmdir`, `mkdir`, `touch`, `truncate`, `cp`, `mv`, `install`, `ln`, `chmod`, `chown`, `chgrp`, `tee`, `dd of=`, in-place `sed`/`perl`, and mutating Git commands. Structured Bash `cwd`, `cd`, Git `-C`, globs, home paths, and symbolic links are resolved before comparison. Creating a previously absent top-level namespace under `/tmp` grants process-local ownership only after the tool result confirms that namespace now exists.
+Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `touch`, `truncate`, `cp`, `mv`, `install`, `ln`, `chmod`, `chown`, `chgrp`, `tee`, `dd of=`, 原地修改的 `sed` / `perl`, 以及会修改仓库的 Git 命令。比较前会解析结构化 Bash `cwd`, `cd`, Git `-C`, glob, home 路径和符号链接。只有工具结果确认目录已经创建后, 插件才会授予新临时命名空间当前进程的所有权。
 
-`git push` is always blocked immediately, including wrapped, `git -C`, and compound-command forms. It never opens an approval dialog and cannot be remembered or allowed for the process.
+`git push` 检测覆盖直接调用、wrapper、`git -C`、Git 全局选项和复合命令。`gitPush: "deny"` 时立即拒绝且不打开确认框; `"prompt"` 时独立确认; `"allow"` 时仍保留仓库路径检查。
 
-Regular files, archive entries, and SQLite row writes are evaluated using their underlying file paths. `local://` and `xd://` are OMP session resources and are not treated as external files.
+普通文件、归档条目和 SQLite 行写入按其底层文件路径判断。`local://` 和 `xd://` 是 OMP 会话资源, 不作为外部文件处理。
 
-LSP `request` remains separately confirmed because an arbitrary protocol request can cause server-initiated workspace edits whose targets are not available before execution.
+任意 LSP `request` 仍单独确认, 因为协议请求可能触发服务端工作区编辑, 而执行前无法获得完整目标列表。
 
-## Security boundary
+## 安全边界
 
-This plugin is a guard against accidental writes, not an operating-system sandbox. A shell parser cannot prove the runtime side effects of arbitrary commands.
+本插件用于防止误写, 不是操作系统沙箱。shell 解析器无法证明任意命令的实际副作用。
 
-In particular, auto-approved Bash trusts project runners and scripts such as `just`, `make`, `npm`, `cargo`, Python, and project binaries. A recipe or script can write outside the workspace without showing the final target in the Bash tool arguments. Command substitution, dynamic shell expansion, sourced scripts, aliases, functions, and unknown commands have the same limitation.
+自动批准 Bash 会信任 `just`, `make`, `npm`, `cargo`, Python 和项目二进制等 runner 或脚本。它们可以在最终目标没有出现在 Bash 工具参数中时写入工作区外。命令替换、动态 shell 展开、被 source 的脚本、alias、函数和未知命令也有同样限制。
 
-Use Bubblewrap, a container, or a virtual machine when an enforceable filesystem boundary is required.
+需要强制文件系统边界时, 使用 Bubblewrap、容器或虚拟机。
 
-## Tests
+## 测试
 
-Node.js 22.18 or later:
+要求 Node.js 22.18 或更高版本:
 
 ```bash
 npm test
 ```
 
-Tests cover workspace and external writes, temporary namespace ownership, remembered directory approval, symbolic-link escapes, AST and LSP edits, Bash redirection, Git commands, `cwd`/`cd`, and common file mutation commands.
+测试覆盖工作区内外写入、配置覆盖、白名单和黑名单优先级、临时命名空间所有权、目录授权缓存、符号链接逃逸、AST 和 LSP 修改、Bash 重定向、Git 命令、`cwd` / `cd`, 以及常见文件修改命令。

@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 export type BashTarget =
   | { kind: "path"; value: string; base: string; creates?: true }
   | { kind: "opaque"; value: string }
-  | { kind: "deny"; reason: string };
+  | { kind: "git-push" };
 
 type Token =
   | { kind: "word"; value: string }
@@ -381,7 +381,7 @@ function gitTargets(args: string[], base: string | undefined): BashTarget[] {
 
   const subcommand = args[index];
   if (subcommand === "push") {
-    return [{ kind: "deny", reason: "git push is blocked by workspace write guard" }];
+    return [...scopeTargets, pathTarget(".", gitBase, "git push working directory"), { kind: "git-push" }];
   }
   if (!subcommand || !Object.hasOwn(GIT_MUTATORS, subcommand)) return [];
   const subcommandArgs = args.slice(index + 1);

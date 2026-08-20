@@ -1,0 +1,10 @@
+{
+  "externalWrites": "prompt",
+  "allowPaths": [],
+  "denyPaths": [],
+  "temporary": {
+    "root": "/tmp",
+    "allowOwned": true
+  },
+  "gitPush": "deny"
+}
