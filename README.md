@@ -26,6 +26,43 @@ The plugin loads `workspace-write-guard.json` in the following order. Later sour
 2. The agent configuration directory for the active OMP profile. For the default profile, this is usually `~/.omp/agent/workspace-write-guard.json`.
 3. `<workspace>/.omp/workspace-write-guard.json` in the active workspace.
 
+### User-level configuration
+
+Use the user-level file for rules that should apply to every workspace. For the default OMP profile, create it with:
+
+```bash
+mkdir -p ~/.omp/agent
+cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
+{
+  "externalWrites": "prompt",
+  "denyPaths": ["~/.ssh", "~/.gnupg"],
+  "gitPush": "deny"
+}
+JSON
+```
+
+When OMP uses another profile or `PI_CODING_AGENT_DIR`, place the file in that profile's agent configuration directory instead.
+
+### Project-level configuration
+
+Use a project-level file only for a trusted workspace. From the workspace root:
+
+```bash
+mkdir -p .omp
+cat > .omp/workspace-write-guard.json <<'JSON'
+{
+  "allowPaths": ["../shared-build"],
+  "temporary": {
+    "allowOwned": false
+  }
+}
+JSON
+```
+
+The file may contain only the fields that need to change. Unspecified fields inherit from earlier configuration layers.
+
+Configuration files are strict JSON, not JSONC or YAML. Use double-quoted property names and strings; comments and trailing commas are invalid.
+
 Ordinary fields are overridden field by field. The `allowPaths` and `denyPaths` arrays are replaced as whole arrays. `temporary` is merged by nested field. Relative paths are resolved from the active workspace, and `~` expands to the user's home directory. Glob patterns are not supported. Configuration is loaded and cached when the current OMP process first performs a protected operation. Restart OMP after changing it.
 
 Default configuration:

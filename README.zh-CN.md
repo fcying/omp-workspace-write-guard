@@ -26,6 +26,43 @@
 2. 当前 OMP profile 的 agent 配置目录。默认 profile 通常是 `~/.omp/agent/workspace-write-guard.json`。
 3. 当前工作区的 `<workspace>/.omp/workspace-write-guard.json`。
 
+### 用户级配置
+
+需要对所有工作区生效的规则写在用户级配置中。默认 OMP profile 可以直接创建:
+
+```bash
+mkdir -p ~/.omp/agent
+cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
+{
+  "externalWrites": "prompt",
+  "denyPaths": ["~/.ssh", "~/.gnupg"],
+  "gitPush": "deny"
+}
+JSON
+```
+
+如果 OMP 使用其他 profile 或设置了 `PI_CODING_AGENT_DIR`, 应将文件放到对应 profile 的 agent 配置目录。
+
+### 项目级配置
+
+项目级配置只用于可信工作区。在工作区根目录执行:
+
+```bash
+mkdir -p .omp
+cat > .omp/workspace-write-guard.json <<'JSON'
+{
+  "allowPaths": ["../shared-build"],
+  "temporary": {
+    "allowOwned": false
+  }
+}
+JSON
+```
+
+配置文件只需填写需要修改的字段; 未填写字段继承前一层配置。
+
+配置文件必须是严格 JSON, 不是 JSONC 或 YAML。属性名和字符串必须使用双引号; 不允许注释或尾随逗号。
+
 普通字段逐字段覆盖; `allowPaths` 和 `denyPaths` 数组整体替换; `temporary` 按子字段合并。相对路径以当前工作区为基准, `~` 会展开为用户主目录。不支持 glob。配置在当前 OMP 进程首次执行受保护操作时加载并缓存, 修改后需要重启 OMP。
 
 默认配置:
