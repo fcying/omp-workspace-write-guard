@@ -108,7 +108,7 @@ JSON
 
 ## 推荐的低打扰配置
 
-保留 OMP 的普通 `write` 审批模式, 仅自动批准 Bash:
+保守配置继续使用 OMP 的普通 `write` 审批模式, 只自动批准 Bash:
 
 ```bash
 omp config set tools.approvalMode write
@@ -124,9 +124,24 @@ npm test
 cargo build
 ```
 
+在可信的本地开发环境中, 常用的低打扰配置为:
+
+```bash
+omp config set tools.approvalMode write
+omp config set tools.approval '{"bash":"allow","task":"allow","eval":"allow","hub":"allow","browser":"allow"}'
+```
+
+- `bash`: shell 命令和项目 runner。
+- `task`: 委派给 worker agent 的任务。
+- `eval`: 持久化 Python 和 JavaScript kernel。
+- `hub`: agent 协调及后台进程控制。
+- `browser`: Chromium 自动化。通过 `write(path="xd://browser")` 路由的调用继承此策略, 因此允许 `browser` 后不会再出现外层 `Allow tool: write` 提示。
+
+这些都是可执行工具。`bash`、`eval`、`browser.run`、后台进程和委派 agent 都可能产生无法从显式文件目标中识别的文件系统副作用。只在可信仓库及命令中使用这组配置。与 `yolo` 不同, 未列出的其他可执行工具仍需确认。
+
 OMP 自身的高风险破坏命令保护仍可能要求确认, 例如 `rm -r` 和 `rm -rf`。若要无额外提示地删除插件已认领的临时目录, 可先用非递归 `rm` 删除文件, 再用 `rmdir` 删除空目录。
 
-不要使用 `yolo`, 除非你接受任意可执行工具绕过路径检查的风险。
+不要使用 `yolo`, 除非你接受所有可执行工具都可能绕过路径检查。
 
 ## Marketplace 安装
 

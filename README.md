@@ -108,7 +108,7 @@ If configuration contains unknown fields, invalid enum values, empty paths, or g
 
 ## Recommended low-prompt setup
 
-Keep OMP's normal `write` approval mode and auto-approve only Bash:
+For the conservative setup, keep OMP's normal `write` approval mode and auto-approve only Bash:
 
 ```bash
 omp config set tools.approvalMode write
@@ -124,9 +124,24 @@ npm test
 cargo build
 ```
 
+For a trusted local development environment, the commonly used low-prompt set is:
+
+```bash
+omp config set tools.approvalMode write
+omp config set tools.approval '{"bash":"allow","task":"allow","eval":"allow","hub":"allow","browser":"allow"}'
+```
+
+- `bash`: shell commands and project runners.
+- `task`: delegated worker agents.
+- `eval`: persistent Python and JavaScript kernels.
+- `hub`: agent coordination and background process control.
+- `browser`: Chromium automation. Calls routed through `write(path="xd://browser")` inherit this policy, so allowing `browser` removes the outer `Allow tool: write` prompt.
+
+These are executable tools. `bash`, `eval`, `browser.run`, background processes, and delegated agents can cause filesystem side effects that are not visible as explicit file targets. Use this set only for trusted repositories and commands. Unlike `yolo`, executable tools not listed here still require approval.
+
 OMP's own critical destructive-command guard can still require confirmation for operations such as `rm -r` and `rm -rf`. To remove a temporary tree already owned by the plugin without an additional prompt, remove files with non-recursive `rm` calls and then remove empty directories with `rmdir`.
 
-Do not use `yolo` unless you accept that arbitrary executable tools can bypass path checks.
+Do not use `yolo` unless you accept that every executable tool can bypass path checks.
 
 ## Marketplace installation
 
