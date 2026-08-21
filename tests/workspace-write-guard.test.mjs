@@ -177,7 +177,7 @@ test("extracts edit and move destinations", async (t) => {
   assert.match(result.reason, /outside\/moved\.ts/);
 });
 
-test("guards AST edit scopes but allows internal devices", async (t) => {
+test("guards AST edit scopes, allows internal devices, and rejects unknown devices", async (t) => {
   const { workspace, outside } = await fixture(t);
   const handler = registerHandler();
 
@@ -189,14 +189,74 @@ test("guards AST edit scopes but allows internal devices", async (t) => {
     { toolName: "ast_edit", input: { paths: [join(outside, "**/*.ts")], ops: [] } },
     context(workspace),
   );
-  const internal = await handler(
-    { toolName: "write", input: { path: "xd://resolve", content: "apply proposal" } },
+  const internal = await Promise.all(
+    ["local://plan.md", "xd://resolve"].map((path) =>
+      handler({ toolName: "write", input: { path, content: "internal update" } }, context(workspace))
+    ),
+  );
+  const unknown = await handler(
+    { toolName: "write", input: { path: "unknown://target", content: "blocked" } },
     context(workspace),
   );
 
   assert.equal(inside, undefined);
   assert.equal(external.block, true);
-  assert.equal(internal, undefined);
+  assert.deepEqual(internal, [undefined, undefined]);
+  assert.equal(unknown.block, true);
+});
+
+test("checks conflict resources against their registered file paths", async (t) => {
+  const { workspace, outside, agentDir } = await fixture(t);
+  const { call, result } = registerLifecycleHandlers(agentDir);
+  const insidePath = join(workspace, "inside.c");
+  const outsidePath = join(outside, "outside.c");
+
+  await result({
+    toolCallId: "read-outside-conflict",
+    toolName: "read",
+    input: { path: outsidePath },
+    isError: false,
+    content: [{ type: "text", text: "⚠ 1 unresolved conflict detected\n\n──── #1  L1-5 ────" }],
+    details: { resolvedPath: outsidePath, conflictCount: 1 },
+  });
+  await result({
+    toolCallId: "read-inside-conflict",
+    toolName: "read",
+    input: { path: insidePath },
+    isError: false,
+    content: [{ type: "text", text: "file content that looks like an index\n#1  L80-90\n\n⚠ 1 unresolved conflict detected\n\n──── #2  L1-5 ────" }],
+    details: { resolvedPath: insidePath, conflictCount: 1 },
+  });
+
+  const external = await call(
+    { toolCallId: "resolve-outside", toolName: "write", input: { path: "conflict://1", content: "resolved" } },
+    context(workspace),
+  );
+  const inside = await call(
+    { toolCallId: "resolve-inside", toolName: "write", input: { path: "conflict://2", content: "resolved" } },
+    context(workspace),
+  );
+  const selectedBulk = await call(
+    { toolCallId: "resolve-selected", toolName: "write", input: { path: "conflict://*", content: "2: @ours" } },
+    context(workspace),
+  );
+  const bulk = await call(
+    { toolCallId: "resolve-all", toolName: "write", input: { path: "conflict://*", content: "@ours" } },
+    context(workspace),
+  );
+  const unknown = await call(
+    { toolCallId: "resolve-unknown", toolName: "write", input: { path: "conflict://99", content: "resolved" } },
+    context(workspace),
+  );
+
+  assert.equal(inside, undefined);
+  assert.equal(selectedBulk, undefined);
+  assert.equal(external.block, true);
+  assert.match(external.reason, /outside\/outside\.c/);
+  assert.equal(bulk.block, true);
+  assert.match(bulk.reason, /outside\/outside\.c/);
+  assert.equal(unknown.block, true);
+  assert.match(unknown.reason, /conflict:\/\/99/);
 });
 
 test("allows workspace LSP changes and guards external destinations", async (t) => {
@@ -240,6 +300,7 @@ test("allows common Bash reads, project runners, and workspace writes", async (t
     "printf ok > generated.txt",
     "run-tests 2>&1",
     "git init -b main nested-repo",
+    "git switch feature-branch && git rebase base-branch",
     "git init --initial-branch=main nested-repo-long",
   ];
 

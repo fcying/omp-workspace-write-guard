@@ -185,7 +185,7 @@ Bash checks cover shell output redirection, `rm`, `rmdir`, `mkdir`, `touch`, `tr
 
 `git push` detection covers direct calls, wrappers, `git -C`, Git global options, and compound commands. `gitPush: "deny"` rejects immediately without opening a confirmation dialog. `"prompt"` requests separate confirmation. `"allow"` still preserves repository path checks.
 
-Regular files, archive entries, and SQLite row writes are evaluated using their underlying file paths. `local://` and `xd://` are OMP session resources and are not treated as external files.
+Regular files, archive entries, and SQLite row writes are evaluated using their underlying file paths. `local://` and `xd://` are OMP session resources and are not treated as external files. `conflict://` writes are evaluated using the underlying conflict files registered by the current session.
 
 Arbitrary LSP `request` calls remain separately confirmed because a protocol request can trigger server-initiated workspace edits whose complete targets are unavailable before execution.
 

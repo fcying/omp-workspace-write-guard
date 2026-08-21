@@ -185,7 +185,7 @@ Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `touch`, `trunc
 
 `git push` 检测覆盖直接调用、wrapper、`git -C`、Git 全局选项和复合命令。`gitPush: "deny"` 时立即拒绝且不打开确认框; `"prompt"` 时独立确认; `"allow"` 时仍保留仓库路径检查。
 
-普通文件、归档条目和 SQLite 行写入按其底层文件路径判断。`local://` 和 `xd://` 是 OMP 会话资源, 不作为外部文件处理。
+普通文件、归档条目和 SQLite 行写入按其底层文件路径判断。`local://` 和 `xd://` 是 OMP 会话资源, 不作为外部文件处理。`conflict://` 写入按当前会话登记的底层冲突文件路径判断。
 
 任意 LSP `request` 仍单独确认, 因为协议请求可能触发服务端工作区编辑, 而执行前无法获得完整目标列表。
 

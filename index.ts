@@ -92,6 +92,45 @@ function cleanPath(raw: string): string {
   return value;
 }
 
+function bulkConflictIds(content: unknown): number[] | undefined {
+  if (typeof content !== "string") return undefined;
+  const lines = content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) return undefined;
+
+  const ids = new Set<number>();
+  for (const line of lines) {
+    const match = line.match(/^#?([1-9][0-9]*)\s*[:=]\s*@(ours|theirs|base|both)$/);
+    if (!match) return undefined;
+    ids.add(Number(match[1]));
+  }
+  return [...ids];
+}
+
+function conflictTargets(raw: string, content: unknown, conflictPaths: ReadonlyMap<number, string>): Target[] | undefined {
+  const value = cleanPath(raw);
+  const match = value.match(/^(?:(.+):)?conflict:\/\/(.+)$/);
+  if (!match) return undefined;
+
+  const id = match[2];
+  if (id === "*") {
+    const selected = bulkConflictIds(content);
+    if (selected) {
+      return selected.map((selectedId) => {
+        const path = conflictPaths.get(selectedId);
+        return path ? { kind: "path", value: path } : { kind: "opaque", value: `conflict://${selectedId}` };
+      });
+    }
+    const paths = [...new Set(conflictPaths.values())];
+    return paths.length > 0
+      ? paths.map((path) => ({ kind: "path", value: path }))
+      : [{ kind: "opaque", value }];
+  }
+  if (!/^[1-9][0-9]*$/.test(id)) return [{ kind: "opaque", value }];
+
+  const path = conflictPaths.get(Number(id));
+  return path ? [{ kind: "path", value: path }] : [{ kind: "opaque", value }];
+}
+
 function writeTarget(raw: string, creates = false): Target | undefined {
   const wrapped = raw.match(/^\[(.*)#[0-9A-F]{4}\]$/);
   const value = cleanPath(wrapped?.[1] ?? raw);
@@ -114,9 +153,14 @@ function writeTarget(raw: string, creates = false): Target | undefined {
   return creates ? { ...target, creates: true } : target;
 }
 
-function targetsFor(toolName: string, input: ToolInput, cwd: string): Target[] {
+function targetsFor(toolName: string, input: ToolInput, cwd: string, conflictPaths: ReadonlyMap<number, string>): Target[] {
   if (toolName === "write") {
-    return strings(input.path).map((value) => writeTarget(value, true)).filter((target): target is Target => target !== undefined);
+    return strings(input.path).flatMap((value) => {
+      const conflicts = conflictTargets(value, input.content, conflictPaths);
+      if (conflicts) return conflicts;
+      const target = writeTarget(value, true);
+      return target ? [target] : [];
+    });
   }
 
   if (toolName === "bash") {
@@ -294,6 +338,7 @@ function isAllowedByConfig(target: string, allowPaths: string[]): boolean {
 export default function workspaceWriteGuard(pi: ExtensionAPI): void {
   pi.setLabel("Workspace write guard");
   const agentDir = pi.pi.getAgentDir();
+  const conflictPaths = new Map<number, string>();
 
   pi.on("tool_call", async (event, ctx) => {
     const input = event.input;
@@ -301,7 +346,7 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
       return { block: true, reason: `Invalid input for ${event.toolName}` };
     }
 
-    const targets = targetsFor(event.toolName, input, ctx.cwd);
+    const targets = targetsFor(event.toolName, input, ctx.cwd, conflictPaths);
     const observesTemporary = event.toolName === "eval";
     if (targets.length === 0 && !observesTemporary) return;
 
@@ -460,6 +505,41 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_result", async (event) => {
+    if (event.toolName === "read" && !event.isError) {
+      const details = event.details;
+      if (
+        details && typeof details === "object" &&
+        "resolvedPath" in details && typeof details.resolvedPath === "string" &&
+        "conflictCount" in details && typeof details.conflictCount === "number" && details.conflictCount > 0
+      ) {
+        const text = event.content
+          .filter((item): item is { type: "text"; text: string } => item.type === "text")
+          .map((item) => item.text)
+          .join("\n");
+        const ids = [...text.matchAll(/(?:^|\n)(?:────\s+)?#\s*([1-9][0-9]*)\s+L[0-9]+(?:-[0-9]+)?(?:\s|$)/g)]
+          .slice(-details.conflictCount);
+        for (const match of ids) conflictPaths.set(Number(match[1]), details.resolvedPath);
+      }
+    }
+
+    if (event.toolName === "write" && !event.isError && typeof event.input.path === "string") {
+      const conflict = cleanPath(event.input.path).match(/^(?:(.+):)?conflict:\/\/(.+)$/);
+      if (conflict?.[2] === "*") {
+        const directives = String(event.input.content ?? "")
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .map((line) => line.match(/^#?([1-9][0-9]*)\s*[:=]\s*@(ours|theirs|base|both)$/));
+        if (directives.length > 0 && directives.every(Boolean)) {
+          for (const directive of directives) conflictPaths.delete(Number(directive?.[1]));
+        } else {
+          conflictPaths.clear();
+        }
+      } else if (conflict && /^[1-9][0-9]*$/.test(conflict[2])) {
+        conflictPaths.delete(Number(conflict[2]));
+      }
+    }
+
     const pending = pendingTemporaryChecks.get(event.toolCallId);
     if (!pending) return;
     pendingTemporaryChecks.delete(event.toolCallId);
