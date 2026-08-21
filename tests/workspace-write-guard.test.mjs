@@ -310,7 +310,7 @@ test("allows common Bash reads, project runners, and workspace writes", async (t
   }
 });
 
-test("applies allowPaths, denyPaths, and externalWrites precedence", async (t) => {
+test("applies allowPaths, protectedPaths, and externalWrites precedence", async (t) => {
   const { root, workspace, outside, agentDir } = await fixture(t);
   const other = join(root, "other");
   const protectedExternal = join(outside, "protected");
@@ -319,9 +319,10 @@ test("applies allowPaths, denyPaths, and externalWrites precedence", async (t) =
   await writeConfig(join(workspace, ".omp"), {
     externalWrites: "deny",
     allowPaths: [outside],
-    denyPaths: [protectedExternal, protectedWorkspace],
+    protectedPaths: { paths: [protectedExternal, protectedWorkspace], policy: "deny" },
   });
   const handler = registerHandler(agentDir);
+  const prompts = [];
 
   const allowed = await handler(
     { toolName: "write", input: { path: join(outside, "allowed.txt"), content: "ok" } },
@@ -329,41 +330,268 @@ test("applies allowPaths, denyPaths, and externalWrites precedence", async (t) =
   );
   const deniedExternal = await handler(
     { toolName: "write", input: { path: join(protectedExternal, "blocked.txt"), content: "no" } },
-    context(workspace, { hasUI: true, approve: true }),
+    context(workspace, { hasUI: true, approve: true, prompts }),
   );
   const deniedWorkspace = await handler(
     { toolName: "write", input: { path: join(protectedWorkspace, "blocked.txt"), content: "no" } },
-    context(workspace, { hasUI: true, approve: true }),
+    context(workspace, { hasUI: true, approve: true, prompts }),
+  );
+  const deniedRead = await handler(
+    { toolName: "read", input: { path: join(protectedWorkspace, "secret.txt") } },
+    context(workspace, { hasUI: true, approve: true, prompts }),
+  );
+  const deniedAliasRead = await handler(
+    { toolName: "read", input: { path: join(workspace, "external-link", "protected", "secret.txt") } },
+    context(workspace, { hasUI: true, approve: true, prompts }),
   );
   const deniedUnlisted = await handler(
     { toolName: "write", input: { path: join(other, "blocked.txt"), content: "no" } },
-    context(workspace, { hasUI: true, approve: true }),
+    context(workspace, { hasUI: true, approve: true, prompts }),
   );
 
   assert.equal(allowed, undefined);
-  assert.match(deniedExternal.reason, /denied by workspace write guard configuration/);
-  assert.match(deniedWorkspace.reason, /denied by workspace write guard configuration/);
+  assert.match(deniedExternal.reason, /Protected path access denied by configuration/);
+  assert.match(deniedWorkspace.reason, /Protected path access denied by configuration/);
+  assert.match(deniedRead.reason, /Protected path access denied by configuration/);
+  assert.match(deniedAliasRead.reason, /Protected path access denied by configuration/);
   assert.match(deniedUnlisted.reason, /denied by configuration/);
+  assert.equal(prompts.length, 0);
+});
+
+test("prompts for each explicit protected file read and write", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  const protectedPath = join(workspace, ".env");
+  await writeFile(protectedPath, "TOKEN=secret\n");
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+  const approvedContext = context(workspace, { hasUI: true, approve: true, prompts });
+
+  const read = await handler(
+    { toolName: "read", input: { path: ".env:1-1" } },
+    approvedContext,
+  );
+  const grep = await handler(
+    { toolName: "grep", input: { path: ".env;notes.txt", pattern: "TOKEN" } },
+    approvedContext,
+  );
+  const write = await handler(
+    { toolName: "write", input: { path: ".env", content: "TOKEN=updated\n" } },
+    approvedContext,
+  );
+  const ordinary = await handler(
+    { toolName: "read", input: { path: ".env.local" } },
+    context(workspace),
+  );
+
+  assert.equal(read, undefined);
+  assert.equal(grep, undefined);
+  assert.equal(write, undefined);
+  assert.equal(ordinary, undefined);
+  assert.equal(prompts.length, 3);
+  assert.deepEqual(prompts.map(({ title }) => title), [
+    "Allow protected access?",
+    "Allow protected access?",
+    "Allow protected access?",
+  ]);
+  assert.match(prompts[0].body, new RegExp(`read: ${protectedPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(prompts[2].body, new RegExp(`write: ${protectedPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+});
+
+test("fails closed for protected file prompts without a UI", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  const handler = registerHandler(agentDir);
+
+  const result = await handler(
+    { toolName: "read", input: { path: ".env" } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /Protected access blocked without interactive approval/);
+  assert.match(result.reason, /read: .*\.env/);
+});
+
+test("prompts for each protected path access and parent modification", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  const protectedDirectory = join(workspace, "protected");
+  const protectedFile = join(protectedDirectory, "secret.txt");
+  await mkdir(protectedDirectory);
+  await writeFile(protectedFile, "secret\n");
+  await writeConfig(join(workspace, ".omp"), {
+    protectedPaths: { paths: [protectedDirectory], policy: "prompt" },
+  });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+  const approvedContext = context(workspace, { hasUI: true, approve: true, prompts });
+
+  const read = await handler(
+    { toolName: "read", input: { path: protectedFile } },
+    approvedContext,
+  );
+  const write = await handler(
+    { toolName: "write", input: { path: protectedFile, content: "updated\n" } },
+    approvedContext,
+  );
+  const parentDelete = await handler(
+    { toolName: "delete", input: { path: workspace } },
+    approvedContext,
+  );
+  const withoutUi = await handler(
+    { toolName: "read", input: { path: protectedFile } },
+    context(workspace),
+  );
+  const ordinary = await handler(
+    { toolName: "read", input: { path: join(workspace, "ordinary.txt") } },
+    context(workspace),
+  );
+
+  assert.equal(read, undefined);
+  assert.equal(write, undefined);
+  assert.equal(parentDelete, undefined);
+  assert.equal(prompts.length, 3);
+  assert.ok(prompts.every(({ title }) => title === "Allow protected access?"));
+  assert.match(prompts[0].body, /Protected targets:/);
+  assert.match(withoutUi.reason, /Protected access blocked without interactive approval/);
+  assert.equal(ordinary, undefined);
+});
+
+test("denies protected files without prompting and resolves symbolic links", async (t) => {
+  const { workspace, outside, agentDir } = await fixture(t);
+  const protectedPath = join(outside, ".env");
+  const alias = join(workspace, "settings.txt");
+  await writeFile(protectedPath, "TOKEN=secret\n");
+  await symlink(protectedPath, alias);
+  await writeConfig(join(workspace, ".omp"), { protectedFiles: { policy: "deny" } });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+
+  const read = await handler(
+    { toolName: "read", input: { path: alias } },
+    context(workspace, { hasUI: true, approve: true, prompts }),
+  );
+  const write = await handler(
+    { toolName: "write", input: { path: protectedPath, content: "TOKEN=updated\n" } },
+    context(workspace, { hasUI: true, approve: true, prompts }),
+  );
+
+  assert.equal(read.block, true);
+  assert.match(read.reason, /Protected file access denied by configuration/);
+  assert.match(read.reason, /settings\.txt.*\.env/);
+  assert.equal(write.block, true);
+  assert.match(write.reason, /Protected file access denied by configuration/);
+  assert.equal(prompts.length, 0);
+});
+
+test("allows disabling the default protected file names", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { protectedFiles: { names: [] } });
+  const handler = registerHandler(agentDir);
+
+  const read = await handler(
+    { toolName: "read", input: { path: ".env" } },
+    context(workspace),
+  );
+  const write = await handler(
+    { toolName: "write", input: { path: ".env", content: "TOKEN=value\n" } },
+    context(workspace),
+  );
+
+  assert.equal(read, undefined);
+  assert.equal(write, undefined);
+});
+
+test("expands environment variables in configured paths", async (t) => {
+  const { root, workspace, agentDir } = await fixture(t);
+  const variable = `OMP_WRITE_GUARD_TEST_ROOT_${process.pid}`;
+  const previous = process.env[variable];
+  process.env[variable] = root;
+  t.after(() => {
+    if (previous === undefined) delete process.env[variable];
+    else process.env[variable] = previous;
+  });
+
+  const allowed = join(root, "environment-allowed");
+  const denied = join(root, "environment-denied");
+  const temporaryRoot = join(root, "environment-temporary");
+  await mkdir(allowed);
+  await mkdir(denied);
+  await mkdir(temporaryRoot);
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "deny",
+    allowPaths: [`$${variable}/environment-allowed`],
+    protectedPaths: { paths: ["${" + variable + "}/environment-denied"] },
+    temporary: { root: `$${variable}/environment-temporary` },
+  });
+  const handler = registerHandler(agentDir);
+
+  const allowedWrite = await handler(
+    { toolName: "write", input: { path: join(allowed, "file.txt"), content: "ok" } },
+    context(workspace),
+  );
+  const deniedWrite = await handler(
+    { toolName: "write", input: { path: join(denied, "file.txt"), content: "no" } },
+    context(workspace),
+  );
+  const temporaryWrite = await handler(
+    { toolName: "write", input: { path: join(temporaryRoot, "new-namespace", "file.txt"), content: "ok" } },
+    context(workspace),
+  );
+
+  assert.equal(allowedWrite, undefined);
+  assert.match(deniedWrite.reason, /Protected path access denied by configuration/);
+  assert.equal(temporaryWrite, undefined);
+});
+
+test("fails closed when a configured environment variable is undefined", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  const variable = `OMP_WRITE_GUARD_MISSING_${process.pid}`;
+  const previous = process.env[variable];
+  delete process.env[variable];
+  t.after(() => {
+    if (previous !== undefined) process.env[variable] = previous;
+  });
+  await writeConfig(join(workspace, ".omp"), { protectedPaths: { paths: [`$${variable}/secret`] } });
+  const handler = registerHandler(agentDir);
+
+  const result = await handler(
+    { toolName: "write", input: { path: "src/file.ts", content: "no" } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /configuration error/);
+  assert.match(result.reason, new RegExp(`undefined or empty environment variable ${variable}`));
 });
 
 test("merges user and project configuration with project settings last", async (t) => {
   const { workspace, outside, agentDir } = await fixture(t);
+  const protectedDirectory = join(workspace, "protected");
+  await mkdir(protectedDirectory);
   await writeConfig(agentDir, {
     externalWrites: "deny",
     temporary: { allowOwned: false },
+    protectedPaths: { paths: [protectedDirectory], policy: "deny" },
   });
   await writeConfig(join(workspace, ".omp"), {
     externalWrites: "allow",
     temporary: { allowOwned: true },
+    protectedPaths: { policy: "prompt" },
   });
   const handler = registerHandler(agentDir);
+  const prompts = [];
 
   const result = await handler(
     { toolName: "write", input: { path: join(outside, "allowed.txt"), content: "ok" } },
     context(workspace),
   );
+  const protectedWrite = await handler(
+    { toolName: "write", input: { path: join(protectedDirectory, "file.txt"), content: "ok" } },
+    context(workspace, { hasUI: true, approve: true, prompts }),
+  );
 
   assert.equal(result, undefined);
+  assert.equal(protectedWrite, undefined);
+  assert.equal(prompts.length, 1);
 });
 
 test("fails closed on invalid configuration without blocking read-only tools", async (t) => {

@@ -8,8 +8,8 @@ This file applies to the entire repository.
 
 This plugin provides low-prompt workspace write protection for OMP:
 
-- Reads from any location are allowed.
-- Direct file modifications inside the current workspace are allowed.
+- Reads from any location are allowed unless an explicit file path matches the configured `protectedPaths` or `protectedFiles` policy.
+- Direct file modifications inside the current workspace are allowed unless they match a protected-access policy.
 - Direct modifications outside the workspace follow the configured `externalWrites` policy.
 - After interactive approval, the real parent directory is remembered only for the current OMP process and workspace.
 - An unapproved external modification is denied when no interactive UI is available.
@@ -38,6 +38,7 @@ This plugin is an accidental-write guard, not an operating-system sandbox. Never
 - Treat `local://` and `xd://` as OMP internal resources rather than ordinary external filesystem paths.
 - Continue to confirm arbitrary LSP `request` calls. Known rename and code-action operations wholly inside the workspace should not create extra prompts.
 - Bash parsing protects only explicit write targets visible in the command line. Any coverage change must preserve an accurate security-boundary section in `README.md`.
+- Protected-path and protected-file checks cover only explicit paths supplied to supported tools. Keep the README security boundary accurate for directory searches, glob searches, Bash, Eval, scripts, and other implicit access.
 - Detect direct, wrapped, `git -C`, Git-global-option, and compound-command forms of `git push`; apply the configured policy without bypassing external repository checks.
 - Do not add compatibility aliases, deprecated entry points, speculative features, or unnecessary abstractions. Keep the implementation conservative and auditable.
 
@@ -62,6 +63,7 @@ New or changed permission rules require behavioral tests that fail under a plaus
 - Reuse of an approved directory and its descendants without approving sibling directories.
 - Symbolic-link escapes being denied.
 - Fail-closed behavior without a UI.
+- Explicit protected-path and protected-file reads and writes following `prompt` and `deny`, including fail-closed behavior without a UI.
 - Common read-only Bash commands and project runners not being falsely blocked.
 - Explicit Bash writes outside the workspace being denied.
 - Every supported `git push` form following the configured policy without prompts under the default denial policy.

@@ -1,7 +1,14 @@
 {
   "externalWrites": "prompt",
   "allowPaths": [],
-  "denyPaths": [],
+  "protectedPaths": {
+    "paths": [],
+    "policy": "deny"
+  },
+  "protectedFiles": {
+    "names": [".env"],
+    "policy": "prompt"
+  },
   "temporary": {
     "root": "/tmp",
     "allowOwned": true

@@ -38,14 +38,15 @@ const resolvedConfigs = new Map<string, Promise<ResolvedGuardConfig>>();
 type ToolInput = Record<string, unknown>;
 
 type Target =
-  | { kind: "path"; value: string; base?: string; creates?: true }
+  | { kind: "path"; value: string; base?: string; creates?: true; access?: "read" }
   | { kind: "opaque"; value: string }
   | { kind: "git-push" };
 
 interface ResolvedGuardConfig {
   values: GuardConfig;
   allowPaths: string[];
-  denyPaths: string[];
+  protectedPaths: string[];
+  protectedFileNames: Set<string>;
   temporaryRoot: string;
 }
 
@@ -153,6 +154,13 @@ function writeTarget(raw: string, creates = false): Target | undefined {
   return creates ? { ...target, creates: true } : target;
 }
 
+function readTarget(raw: string): Target | undefined {
+  const selector = /:(?:raw(?::\d+(?:-\d*|\+\d+)?(?:,\d+(?:-\d*|\+\d+)?)*)?|\d+(?:-\d*|\+\d+)?(?:,\d+(?:-\d*|\+\d+)?)*(?::raw)?|conflicts)$/;
+  const value = cleanPath(raw).replace(selector, "");
+  const target = writeTarget(value);
+  return target?.kind === "path" ? { ...target, access: "read" } : undefined;
+}
+
 function targetsFor(toolName: string, input: ToolInput, cwd: string, conflictPaths: ReadonlyMap<number, string>): Target[] {
   if (toolName === "write") {
     return strings(input.path).flatMap((value) => {
@@ -163,6 +171,20 @@ function targetsFor(toolName: string, input: ToolInput, cwd: string, conflictPat
     });
   }
 
+  if (toolName === "read") {
+    return strings(input.path).flatMap((value) => {
+      const target = readTarget(value);
+      return target ? [target] : [];
+    });
+  }
+
+  if (toolName === "grep") {
+    return strings(input.path).flatMap((paths) => paths.split(";").flatMap((value) => {
+      if (/[?*[{]/.test(value)) return [];
+      const target = readTarget(value);
+      return target ? [target] : [];
+    }));
+  }
   if (toolName === "bash") {
     const command = typeof input.command === "string" ? input.command : "";
     const requestedCwd = typeof input.cwd === "string" ? input.cwd : undefined;
@@ -223,11 +245,15 @@ function expandHome(path: string): string {
   return path;
 }
 
+function normalizedPath(path: string, cwd: string): string {
+  const expanded = expandHome(cleanPath(path));
+  return isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
+}
+
 async function canonicalPath(path: string, cwd: string, depth = 0): Promise<string> {
   if (depth > 32) throw new Error(`Too many symbolic links: ${path}`);
 
-  const expanded = expandHome(cleanPath(path));
-  const absolute = isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
+  const absolute = normalizedPath(path, cwd);
   const missing: string[] = [];
   let cursor = absolute;
 
@@ -322,14 +348,16 @@ function unique(values: string[]): string[] {
 async function resolveGuardConfig(agentDir: string, workspace: string): Promise<ResolvedGuardConfig> {
   const values = await loadGuardConfig(agentDir, workspace);
   const allowPaths = await Promise.all(values.allowPaths.map((path) => canonicalPath(path, workspace)));
-  const denyPaths = await Promise.all(values.denyPaths.map((path) => canonicalPath(path, workspace)));
+  const protectedPaths = await Promise.all(values.protectedPaths.paths.map((path) => canonicalPath(path, workspace)));
+  const protectedFileNames = new Set(values.protectedFiles.names);
   const temporaryRoot = await canonicalPath(values.temporary.root, workspace);
-  return { values, allowPaths, denyPaths, temporaryRoot };
+  return { values, allowPaths, protectedPaths, protectedFileNames, temporaryRoot };
 }
 
 function overlapsConfiguredPath(target: string, configuredPaths: string[]): boolean {
   return configuredPaths.some((path) => isWithin(path, target) || isWithin(target, path));
 }
+
 
 function isAllowedByConfig(target: string, allowPaths: string[]): boolean {
   return allowPaths.some((path) => isWithin(path, target));
@@ -393,6 +421,7 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     const provisionalTemporaryPaths = new Set<string>();
     const temporaryCandidates = new Set<string>();
     const external: Array<{ display: string; directory?: string }> = [];
+    const protectedTargets: Array<{ display: string; access: "read" | "write" }> = [];
     const commandRequests = gitPush && config.values.gitPush === "prompt" ? ["git push"] : [];
 
     for (const target of targets) {
@@ -402,11 +431,25 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
         continue;
       }
 
+      const base = target.base ?? ctx.cwd;
+      const requested = normalizedPath(target.value, base);
       try {
-        const resolved = await canonicalPath(target.value, target.base ?? ctx.cwd);
-        if (overlapsConfiguredPath(resolved, config.denyPaths)) {
-          return { block: true, reason: `Write denied by workspace write guard configuration: ${resolved}` };
+        const resolved = await canonicalPath(target.value, base);
+        const fileProtected = config.protectedFileNames.has(basename(requested)) || config.protectedFileNames.has(basename(resolved));
+        const pathProtected = target.access === "read"
+          ? config.protectedPaths.some((path) => isWithin(path, resolved))
+          : overlapsConfiguredPath(resolved, config.protectedPaths);
+        const protectedDisplay = requested === resolved ? requested : `${requested} -> ${resolved}`;
+        if (fileProtected && config.values.protectedFiles.policy === "deny") {
+          return { block: true, reason: `Protected file access denied by configuration: ${protectedDisplay}` };
         }
+        if (pathProtected && config.values.protectedPaths.policy === "deny") {
+          return { block: true, reason: `Protected path access denied by configuration: ${protectedDisplay}` };
+        }
+        if (fileProtected || pathProtected) {
+          protectedTargets.push({ display: protectedDisplay, access: target.access ?? "write" });
+        }
+        if (target.access === "read") continue;
         if (
           isAllowedByConfig(resolved, config.allowPaths) ||
           isWithin(root, resolved) ||
@@ -437,12 +480,17 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
           external.push({ display: resolved, directory: await approvalDirectory(resolved) });
         }
       } catch (error) {
-        if (config.denyPaths.length > 0) {
-          return {
-            block: true,
-            reason: `Cannot verify path against workspace write guard denyPaths: ${target.value}`,
-          };
+        const fileProtected = config.protectedFileNames.has(basename(requested));
+        if (fileProtected && config.values.protectedFiles.policy === "deny") {
+          return { block: true, reason: `Protected file access denied by configuration: ${requested}` };
         }
+        if (config.protectedPaths.length > 0 && config.values.protectedPaths.policy === "deny") {
+          return { block: true, reason: `Cannot verify path against workspace write guard protectedPaths: ${target.value}` };
+        }
+        if (fileProtected || config.protectedPaths.length > 0) {
+          protectedTargets.push({ display: `${requested} (unresolved)`, access: target.access ?? "write" });
+        }
+        if (target.access === "read") continue;
         if (config.values.externalWrites !== "allow") {
           external.push({
             display: error instanceof Error ? `${target.value} (${error.message})` : `${target.value} (unresolved)`,
@@ -451,12 +499,16 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
       }
     }
 
+    const protectedRequests = unique(
+      protectedTargets.map(({ display, access }) => `${access}: ${display}`),
+    );
+
     const requested = unique([
       ...commandRequests,
       ...external.map(({ display }) => display),
     ]);
-    if (requested.length === 0) {
-      if (typeof event.toolCallId === "string" && targets.length > 0) {
+    if (protectedRequests.length === 0 && requested.length === 0) {
+      if (typeof event.toolCallId === "string" && (temporaryCandidates.size > 0 || existingTemporaryNamespaces)) {
         pendingTemporaryChecks.set(event.toolCallId, {
           workspace: root,
           candidates: [...temporaryCandidates],
@@ -467,12 +519,14 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
       return;
     }
 
-    if ((external.length > 0 && config.values.externalWrites === "deny") || !ctx.hasUI) {
-      if (external.length > 0 && config.values.externalWrites === "deny") {
-        return { block: true, reason: `Write outside workspace denied by configuration: ${requested.join(", ")}` };
-      }
-      const subject = commandRequests.length > 0 ? "Operation outside workspace" : "Write outside workspace";
-      return { block: true, reason: `${subject} blocked without interactive approval: ${requested.join(", ")}` };
+    if (external.length > 0 && config.values.externalWrites === "deny") {
+      return { block: true, reason: `Write outside workspace denied by configuration: ${requested.join(", ")}` };
+    }
+    if (!ctx.hasUI) {
+      const subject = protectedRequests.length > 0
+        ? "Protected access"
+        : commandRequests.length > 0 ? "Operation outside workspace" : "Write outside workspace";
+      return { block: true, reason: `${subject} blocked without interactive approval: ${[...protectedRequests, ...requested].join(", ")}` };
     }
 
     const rememberedDirectories = unique(
@@ -481,20 +535,35 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     const rememberNotice = rememberedDirectories.length > 0
       ? `\n\nRemember for this OMP process:\n${rememberedDirectories.map((path) => `- ${path}`).join("\n")}`
       : "";
+    const protectedOnly = protectedRequests.length > 0 && requested.length === 0;
+    const outsideOnly = protectedRequests.length === 0;
+    const title = protectedOnly
+      ? "Allow protected access?"
+      : outsideOnly
+        ? commandRequests.length > 0 ? "Allow operation outside workspace?" : "Allow write outside workspace?"
+        : "Allow protected access outside workspace?";
+    const protectedNotice = protectedRequests.length > 0
+      ? `\n\nProtected targets:\n${protectedRequests.map((path) => `- ${path}`).join("\n")}`
+      : "";
+    const outsideNotice = requested.length > 0
+      ? `\n\nTargets:\n${requested.map((path) => `- ${path}`).join("\n")}`
+      : "";
     const approved = await ctx.ui.confirm(
-      commandRequests.length > 0 ? "Allow operation outside workspace?" : "Allow write outside workspace?",
-      `Workspace: ${root}\n\nTargets:\n${requested.map((path) => `- ${path}`).join("\n")}${rememberNotice}`,
+      title,
+      `Workspace: ${root}${protectedNotice}${outsideNotice}${rememberNotice}`,
     );
     if (!approved) {
-      const subject = commandRequests.length > 0 ? "operation outside workspace" : "write outside workspace";
+      const subject = protectedRequests.length > 0
+        ? "protected access"
+        : commandRequests.length > 0 ? "operation outside workspace" : "write outside workspace";
       return {
         block: true,
-        reason: `User denied ${subject}: ${requested.join(", ")}`,
+        reason: `User denied ${subject}: ${[...protectedRequests, ...requested].join(", ")}`,
       };
     }
 
     for (const directory of rememberedDirectories) approvedDirectories.add(directory);
-    if (typeof event.toolCallId === "string" && targets.length > 0) {
+    if (typeof event.toolCallId === "string" && (temporaryCandidates.size > 0 || existingTemporaryNamespaces)) {
       pendingTemporaryChecks.set(event.toolCallId, {
         workspace: root,
         candidates: [...temporaryCandidates],

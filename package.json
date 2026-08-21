@@ -1,7 +1,7 @@
 {
   "name": "omp-workspace-write-guard",
-  "version": "0.4.3",
-  "description": "Prompt before OMP writes outside the current workspace.",
+  "version": "0.4.6",
+  "description": "Guard OMP workspace writes and explicit protected access.",
   "type": "module",
   "files": [
     "bash-targets.ts",

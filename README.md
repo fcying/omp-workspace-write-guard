@@ -6,8 +6,8 @@ Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `e
 
 ## Behavior
 
-- Reads from any location are allowed by default.
-- Direct file modifications inside the current workspace are allowed by default.
+- Reads from any location are allowed by default, except explicit access matched by `protectedPaths` or `protectedFiles`. By default, direct reads and writes of a file named `.env` require confirmation.
+- Direct file modifications inside the current workspace are otherwise allowed by default.
 - Direct modifications outside the workspace follow the `externalWrites` policy and require interactive confirmation by default.
 - After an external target is approved, the plugin remembers its real parent directory only for the current OMP process and workspace. Later writes to that directory or its descendants do not prompt again.
 - Directory approvals reset when OMP restarts and are not shared across workspaces.
@@ -28,14 +28,28 @@ The plugin loads `workspace-write-guard.json` in the following order. Later sour
 
 ### User-level configuration
 
-Use the user-level file for rules that should apply to every workspace. For the default OMP profile, create it with:
+Use the user-level file for rules that should apply to every workspace. For the default OMP profile, the following command directly creates a complete configuration file. This example explicitly opts into denying access to SSH and GnuPG paths; those paths are not protected by the bundled default configuration.
+
+Installing or upgrading the plugin does not create or overwrite this file. Configuration remains an explicit user action so plugin lifecycle operations never change global access policy.
 
 ```bash
 mkdir -p ~/.omp/agent
 cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
 {
   "externalWrites": "prompt",
-  "denyPaths": ["~/.ssh", "~/.gnupg"],
+  "allowPaths": [],
+  "protectedPaths": {
+    "paths": ["~/.ssh", "~/.gnupg"],
+    "policy": "deny"
+  },
+  "protectedFiles": {
+    "names": [".env"],
+    "policy": "prompt"
+  },
+  "temporary": {
+    "root": "/tmp",
+    "allowOwned": true
+  },
   "gitPush": "deny"
 }
 JSON
@@ -63,7 +77,7 @@ The file may contain only the fields that need to change. Unspecified fields inh
 
 Configuration files are strict JSON, not JSONC or YAML. Use double-quoted property names and strings; comments and trailing commas are invalid.
 
-Ordinary fields are overridden field by field. The `allowPaths` and `denyPaths` arrays are replaced as whole arrays. `temporary` is merged by nested field. Relative paths are resolved from the active workspace, and `~` expands to the user's home directory. Glob patterns are not supported. Configuration is loaded and cached when the current OMP process first performs a protected operation. Restart OMP after changing it.
+Ordinary fields are overridden field by field. The `allowPaths`, `protectedPaths.paths`, and `protectedFiles.names` arrays are replaced as whole arrays. `temporary`, `protectedPaths`, and `protectedFiles` are merged by nested field. Relative paths are resolved from the active workspace, and `~` expands to the user's home directory. Path fields (`allowPaths`, `protectedPaths.paths`, and `temporary.root`) expand `$NAME` and `${NAME}` from the OMP process environment. Expansion occurs once; shell defaults such as `${NAME:-default}`, command substitution, `%NAME%`, and glob patterns are not supported. An undefined or empty referenced variable is a configuration error. Configuration is loaded and cached when the current OMP process first performs a protected operation. Restart OMP after changing the configuration or its referenced environment variables.
 
 Default configuration:
 
@@ -71,7 +85,14 @@ Default configuration:
 {
   "externalWrites": "prompt",
   "allowPaths": [],
-  "denyPaths": [],
+  "protectedPaths": {
+    "paths": [],
+    "policy": "deny"
+  },
+  "protectedFiles": {
+    "names": [".env"],
+    "policy": "prompt"
+  },
   "temporary": {
     "root": "/tmp",
     "allowOwned": true
@@ -84,17 +105,28 @@ Fields:
 
 - `externalWrites`: `"prompt"`, `"deny"`, or `"allow"`. Controls external writes that do not match another rule.
 - `allowPaths`: File or directory paths that can be written without confirmation. Each entry permits only that path and its descendants.
-- `denyPaths`: File or directory paths that cannot be written. This takes precedence over the workspace, `allowPaths`, and session approvals. It protects the path itself, its descendants, and parent deletion or move operations that could contain it.
+- `protectedPaths.paths`: File or directory paths whose explicit access is protected. Reads match the path and its descendants. Writes also match parent deletion or move operations that could contain a protected path. This takes precedence over the workspace, `allowPaths`, and session approvals. Set this to `[]` to disable path protection.
+- `protectedPaths.policy`: `"prompt"` or `"deny"`. `"prompt"` confirms every matching tool call and fails closed without an interactive UI; approval is not remembered. `"deny"` blocks immediately without opening a confirmation dialog.
+- `protectedFiles.names`: Exact file names whose explicit reads and writes are protected in any directory. Glob patterns and path separators are rejected. Set this to `[]` to disable the bundled `.env` rule.
+- `protectedFiles.policy`: `"prompt"` or `"deny"`. `"prompt"` confirms every matching tool call and fails closed without an interactive UI; approval is not remembered. `"deny"` blocks immediately without opening a confirmation dialog.
+
 - `temporary.root`: The temporary root under which newly created namespaces can be claimed automatically.
 - `temporary.allowOwned`: Enables automatic temporary namespace ownership.
 - `gitPush`: `"deny"`, `"prompt"`, or `"allow"`. Even when set to `"allow"`, external repository paths supplied through `git -C` or `--git-dir` still undergo external path checks.
 
-Example: deny writes to key directories, allow a shared build directory, disable automatic temporary ownership, and prompt for every `git push`:
+Example: deny explicit access to key and XDG configuration paths, protect `.env` and `.env.local` with an interactive prompt, allow a shared build directory, disable automatic temporary ownership, and prompt for every `git push`:
 
 ```json
 {
   "allowPaths": ["~/shared-build"],
-  "denyPaths": ["~/.ssh", "./secrets"],
+  "protectedPaths": {
+    "paths": ["~/.ssh", "$XDG_CONFIG_HOME/shell/private", "./secrets"],
+    "policy": "deny"
+  },
+  "protectedFiles": {
+    "names": [".env", ".env.local"],
+    "policy": "prompt"
+  },
   "temporary": {
     "allowOwned": false
   },
@@ -104,7 +136,7 @@ Example: deny writes to key directories, allow a shared build directory, disable
 
 Project configuration loads last and can therefore weaken user configuration. Enable project configuration only in trusted repositories. For untrusted repositories, use user-level configuration and inspect `.omp/workspace-write-guard.json` in the project.
 
-If configuration contains unknown fields, invalid enum values, empty paths, or glob patterns, the plugin fails closed for protected operations and reports the exact configuration error. Read-only tools are not affected by invalid write configuration.
+If configuration contains unknown fields, invalid enum values, empty paths or file names, undefined or empty environment variables, path separators or glob patterns in protected file names, or glob patterns in path fields, the plugin fails closed for operations it protects and reports the exact configuration error. Uncovered read-only tools are not affected by invalid configuration.
 
 ## Recommended low-prompt setup
 
@@ -184,6 +216,10 @@ omp plugin install omp-workspace-write-guard@fcying-omp-plugins
 
 This repository is both the `fcying-omp-plugins` marketplace and the plugin source. Remote users refresh its catalog from GitHub, while a local marketplace reads directly from the working tree.
 
+## Covered protected access
+
+`protectedPaths` checks explicit file paths supplied to `read`, non-glob `grep` roots, and the modification tools listed below. Reads match protected paths and their descendants; writes also match parent deletion and move operations that could contain a protected path. `protectedFiles` applies exact file-name matching to the same explicit targets. Symbolic links are resolved before matching, and the confirmation displays both the requested and real paths when they differ. Directory or glob searches are not expanded to discover protected descendants.
+
 ## Covered modification paths
 
 The plugin intercepts:
@@ -208,7 +244,7 @@ Arbitrary LSP `request` calls remain separately confirmed because a protocol req
 
 This plugin guards against accidental writes. It is not an operating-system sandbox. A shell parser cannot prove the actual side effects of an arbitrary command.
 
-Auto-approved Bash trusts project runners and scripts such as `just`, `make`, `npm`, `cargo`, Python, and project binaries. They can write outside the workspace when the final target is not visible in the Bash tool arguments. Command substitution, dynamic shell expansion, sourced scripts, aliases, functions, and unknown commands have the same limitation. Temporary-root snapshots only identify reported new namespaces; they do not audit other code side effects.
+Auto-approved Bash trusts project runners and scripts such as `just`, `make`, `npm`, `cargo`, Python, and project binaries. They can read protected paths or files, or write outside the workspace, when the final path is not visible in the tool arguments. Command substitution, dynamic shell expansion, sourced scripts, aliases, functions, unknown commands, directory searches, and glob searches have the same limitation. Temporary-root snapshots only identify reported new namespaces; they do not audit other code side effects.
 
 Use Bubblewrap, a container, or a virtual machine when an enforceable filesystem boundary is required.
 
@@ -220,4 +256,4 @@ Requires Node.js 22.18 or later:
 npm test
 ```
 
-Tests cover workspace and external writes, configuration precedence, allowlist and denylist priority, temporary namespace ownership, remembered directory approval, symbolic-link escapes, AST and LSP edits, Bash redirection, Git commands, `cwd` and `cd`, and common file modification commands.
+Tests cover protected path and file prompts and denials, workspace and external writes, configuration precedence, allowlist and protected-path priority, temporary namespace ownership, remembered directory approval, symbolic-link escapes, AST and LSP edits, Bash redirection, Git commands, `cwd` and `cd`, and common file modification commands.

@@ -6,8 +6,8 @@
 
 ## 行为
 
-- 任意位置的读取默认允许。
-- 当前工作区内的直接文件修改默认允许。
+- 任意位置的读取默认允许, 但 `protectedPaths` 或 `protectedFiles` 匹配的显式访问除外。默认情况下, 直接读取或写入名为 `.env` 的文件需要确认。
+- 当前工作区内的其他直接文件修改默认允许。
 - 工作区外的直接修改按 `externalWrites` 策略处理, 默认要求交互确认。
 - 外部目标通过确认后, 插件只在当前 OMP 进程和当前工作区内记住其真实父目录。后续写入该目录及其子目录不再提示。
 - OMP 重启后清空目录授权; 不同工作区之间不共享授权。
@@ -28,14 +28,28 @@
 
 ### 用户级配置
 
-需要对所有工作区生效的规则写在用户级配置中。默认 OMP profile 可以直接创建:
+需要对所有工作区生效的规则写在用户级配置中。默认 OMP profile 可用以下命令直接创建一份完整配置。这个示例由用户主动启用 SSH 和 GnuPG 路径拒绝; 包内默认配置不保护这些路径。
+
+安装或升级插件不会创建或覆盖此文件。配置必须由用户显式执行, 避免插件生命周期操作修改全局访问策略。
 
 ```bash
 mkdir -p ~/.omp/agent
 cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
 {
   "externalWrites": "prompt",
-  "denyPaths": ["~/.ssh", "~/.gnupg"],
+  "allowPaths": [],
+  "protectedPaths": {
+    "paths": ["~/.ssh", "~/.gnupg"],
+    "policy": "deny"
+  },
+  "protectedFiles": {
+    "names": [".env"],
+    "policy": "prompt"
+  },
+  "temporary": {
+    "root": "/tmp",
+    "allowOwned": true
+  },
   "gitPush": "deny"
 }
 JSON
@@ -63,7 +77,7 @@ JSON
 
 配置文件必须是严格 JSON, 不是 JSONC 或 YAML。属性名和字符串必须使用双引号; 不允许注释或尾随逗号。
 
-普通字段逐字段覆盖; `allowPaths` 和 `denyPaths` 数组整体替换; `temporary` 按子字段合并。相对路径以当前工作区为基准, `~` 会展开为用户主目录。不支持 glob。配置在当前 OMP 进程首次执行受保护操作时加载并缓存, 修改后需要重启 OMP。
+普通字段逐字段覆盖; `allowPaths`、`protectedPaths.paths` 和 `protectedFiles.names` 数组整体替换; `temporary`、`protectedPaths` 和 `protectedFiles` 按子字段合并。相对路径以当前工作区为基准, `~` 会展开为用户主目录。路径字段 (`allowPaths`、`protectedPaths.paths` 和 `temporary.root`) 会从 OMP 进程环境展开 `$NAME` 和 `${NAME}`。只展开一次; 不支持 `${NAME:-default}` 等 shell 默认值、命令替换、`%NAME%` 或 glob。引用未定义或空值变量属于配置错误。配置在当前 OMP 进程首次执行受保护操作时加载并缓存; 修改配置或其引用的环境变量后需要重启 OMP。
 
 默认配置:
 
@@ -71,7 +85,14 @@ JSON
 {
   "externalWrites": "prompt",
   "allowPaths": [],
-  "denyPaths": [],
+  "protectedPaths": {
+    "paths": [],
+    "policy": "deny"
+  },
+  "protectedFiles": {
+    "names": [".env"],
+    "policy": "prompt"
+  },
   "temporary": {
     "root": "/tmp",
     "allowOwned": true
@@ -84,17 +105,28 @@ JSON
 
 - `externalWrites`: `"prompt"`, `"deny"`, `"allow"`。控制未被其他规则匹配的外部写入。
 - `allowPaths`: 自动允许写入的目录或文件路径。只允许该路径及其后代。
-- `denyPaths`: 无条件拒绝写入的目录或文件路径, 优先级高于工作区、`allowPaths` 和会话授权。会影响目标本身、目标后代, 以及可能包含该路径的父目录删除或移动操作。
+- `protectedPaths.paths`: 保护显式访问的文件或目录路径。读取匹配该路径及其后代; 写入还匹配可能包含受保护路径的父目录删除或移动操作。优先级高于工作区、`allowPaths` 和会话授权。设置为 `[]` 可关闭路径保护。
+- `protectedPaths.policy`: `"prompt"` 或 `"deny"`。`"prompt"` 会为每次匹配的工具调用确认, 无交互 UI 时安全拒绝, 且不会记住批准; `"deny"` 直接拒绝且不打开确认框。
+- `protectedFiles.names`: 在任意目录中保护显式读写的精确文件名。不允许 glob 或路径分隔符。设置为 `[]` 可关闭包内默认的 `.env` 规则。
+- `protectedFiles.policy`: `"prompt"` 或 `"deny"`。`"prompt"` 会为每次匹配的工具调用确认, 无交互 UI 时安全拒绝, 且不会记住批准; `"deny"` 直接拒绝且不打开确认框。
+
 - `temporary.root`: 可自动认领新命名空间的临时根目录。
 - `temporary.allowOwned`: 是否启用临时命名空间自动认领。
 - `gitPush`: `"deny"`, `"prompt"`, `"allow"`。即使设为 `"allow"`, `git -C` 或 `--git-dir` 指向外部仓库时仍会执行外部路径检查。
 
-例如, 禁止修改密钥目录, 自动允许一个共享构建目录, 禁用临时目录自动认领, 并让 `git push` 每次确认:
+例如, 拒绝显式访问密钥及 XDG 配置路径, 交互确认 `.env` 和 `.env.local`, 自动允许一个共享构建目录, 禁用临时目录自动认领, 并让 `git push` 每次确认:
 
 ```json
 {
   "allowPaths": ["~/shared-build"],
-  "denyPaths": ["~/.ssh", "./secrets"],
+  "protectedPaths": {
+    "paths": ["~/.ssh", "$XDG_CONFIG_HOME/shell/private", "./secrets"],
+    "policy": "deny"
+  },
+  "protectedFiles": {
+    "names": [".env", ".env.local"],
+    "policy": "prompt"
+  },
   "temporary": {
     "allowOwned": false
   },
@@ -104,7 +136,7 @@ JSON
 
 项目配置最后加载, 因此可以放宽用户配置。只对可信仓库启用项目级配置; 不可信仓库应使用用户级配置并检查项目中的 `.omp/workspace-write-guard.json`。
 
-配置包含未知字段、非法枚举、空路径或 glob 时, 插件会安全拒绝受保护操作并返回具体配置错误。纯读取工具不受非法写入配置影响。
+配置包含未知字段、非法枚举、空路径或文件名、未定义或空值环境变量、受保护文件名中的路径分隔符或 glob, 或路径字段中的 glob 时, 插件会安全拒绝其保护范围内的操作并返回具体配置错误。不在覆盖范围内的只读工具不受非法配置影响。
 
 ## 推荐的低打扰配置
 
@@ -184,6 +216,10 @@ omp plugin install omp-workspace-write-guard@fcying-omp-plugins
 
 当前仓库同时是 `fcying-omp-plugins` marketplace 和插件源码。远程用户通过 GitHub 仓库更新 catalog; 本地 marketplace 直接读取工作树。
 
+## 覆盖的受保护访问
+
+`protectedPaths` 检查传给 `read` 的显式文件路径、`grep` 的非 glob 根路径, 以及下列修改工具。读取匹配受保护路径及其后代; 写入还匹配可能包含受保护路径的父目录删除和移动操作。`protectedFiles` 对相同的显式目标执行精确文件名匹配。匹配前会解析符号链接; 请求路径与真实路径不同时, 确认框会同时显示两者。目录搜索或 glob 搜索不会被展开以发现受保护的后代文件。
+
 ## 覆盖的修改路径
 
 插件拦截:
@@ -208,7 +244,7 @@ Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `touch`, `trunc
 
 本插件用于防止误写, 不是操作系统沙箱。shell 解析器无法证明任意命令的实际副作用。
 
-自动批准 Bash 会信任 `just`, `make`, `npm`, `cargo`, Python 和项目二进制等 runner 或脚本。它们可以在最终目标没有出现在 Bash 工具参数中时写入工作区外。命令替换、动态 shell 展开、被 source 的脚本、alias、函数和未知命令也有同样限制。临时根目录快照只能识别结果中报告的新命名空间, 不能审计代码的其他副作用。
+自动批准 Bash 会信任 `just`, `make`, `npm`, `cargo`, Python 和项目二进制等 runner 或脚本。最终路径没有出现在工具参数中时, 它们可以读取受保护路径或文件, 或写入工作区外。命令替换、动态 shell 展开、被 source 的脚本、alias、函数、未知命令、目录搜索和 glob 搜索也有同样限制。临时根目录快照只能识别结果中报告的新命名空间, 不能审计代码的其他副作用。
 
 需要强制文件系统边界时, 使用 Bubblewrap、容器或虚拟机。
 
@@ -220,4 +256,4 @@ Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `touch`, `trunc
 npm test
 ```
 
-测试覆盖工作区内外写入、配置覆盖、白名单和黑名单优先级、临时命名空间所有权、目录授权缓存、符号链接逃逸、AST 和 LSP 修改、Bash 重定向、Git 命令、`cwd` / `cd`, 以及常见文件修改命令。
+测试覆盖受保护路径和文件的提示与拒绝、工作区内外写入、配置覆盖、白名单和受保护路径优先级、临时命名空间所有权、目录授权缓存、符号链接逃逸、AST 和 LSP 修改、Bash 重定向、Git 命令、`cwd` / `cd`, 以及常见文件修改命令。
