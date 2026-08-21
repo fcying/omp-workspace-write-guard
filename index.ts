@@ -32,13 +32,15 @@ const pendingTemporaryChecks = new Map<string, {
   candidates: string[];
   temporaryRoot?: string;
   existingNamespaces?: Set<string>;
+  temporaryTemplates?: Array<{ template: string; base: string }>;
+  acceptReportedNamespaces?: true;
 }>();
 const resolvedConfigs = new Map<string, Promise<ResolvedGuardConfig>>();
 
 type ToolInput = Record<string, unknown>;
 
 type Target =
-  | { kind: "path"; value: string; base?: string; creates?: true; access?: "read" }
+  | { kind: "path"; value: string; base?: string; creates?: true; access?: "read"; temporaryTemplate?: true }
   | { kind: "opaque"; value: string }
   | { kind: "git-push" };
 
@@ -339,6 +341,17 @@ async function temporaryNamespaces(temporaryRoot: string): Promise<Set<string> |
   }
 }
 
+function matchesTemporaryTemplate(template: string, candidate: string): boolean {
+  if (dirname(template) !== dirname(candidate)) return false;
+  const templateName = basename(template);
+  const placeholder = /X{3,}$/.exec(templateName);
+  if (!placeholder) return false;
+  const candidateName = basename(candidate);
+  const prefix = templateName.slice(0, placeholder.index);
+  const random = candidateName.slice(prefix.length);
+  return candidateName.startsWith(prefix) && random.length === placeholder[0].length && /^[A-Za-z0-9]+$/.test(random);
+}
+
 
 
 function unique(values: string[]): string[] {
@@ -375,7 +388,9 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     }
 
     const targets = targetsFor(event.toolName, input, ctx.cwd, conflictPaths);
-    const observesTemporary = event.toolName === "eval";
+    const observesTemporary = event.toolName === "eval" || targets.some((target) =>
+      target.kind === "path" && target.temporaryTemplate === true
+    );
     if (targets.length === 0 && !observesTemporary) return;
 
     let root: string;
@@ -414,12 +429,14 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
           candidates: [],
           temporaryRoot: config.temporaryRoot,
           existingNamespaces: existingTemporaryNamespaces,
+          acceptReportedNamespaces: true,
         });
       }
       return;
     }
     const provisionalTemporaryPaths = new Set<string>();
     const temporaryCandidates = new Set<string>();
+    const temporaryTemplates: Array<{ template: string; base: string }> = [];
     const external: Array<{ display: string; directory?: string }> = [];
     const protectedTargets: Array<{ display: string; access: "read" | "write" }> = [];
     const commandRequests = gitPush && config.values.gitPush === "prompt" ? ["git push"] : [];
@@ -460,6 +477,13 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
           continue;
         }
 
+        if (target.temporaryTemplate && existingTemporaryNamespaces) {
+          const namespaceTemplate = temporaryNamespace(config.temporaryRoot, resolved);
+          if (namespaceTemplate === resolved) {
+            temporaryTemplates.push({ template: resolved, base });
+            continue;
+          }
+        }
         const namespace = config.values.temporary.allowOwned && target.creates
           ? temporaryNamespace(config.temporaryRoot, resolved)
           : undefined;
@@ -508,12 +532,17 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
       ...external.map(({ display }) => display),
     ]);
     if (protectedRequests.length === 0 && requested.length === 0) {
-      if (typeof event.toolCallId === "string" && (temporaryCandidates.size > 0 || existingTemporaryNamespaces)) {
+      if (
+        typeof event.toolCallId === "string" &&
+        (temporaryCandidates.size > 0 || existingTemporaryNamespaces || temporaryTemplates.length > 0)
+      ) {
         pendingTemporaryChecks.set(event.toolCallId, {
           workspace: root,
           candidates: [...temporaryCandidates],
           temporaryRoot: existingTemporaryNamespaces ? config.temporaryRoot : undefined,
           existingNamespaces: existingTemporaryNamespaces,
+          temporaryTemplates,
+          ...(event.toolName === "eval" ? { acceptReportedNamespaces: true as const } : {}),
         });
       }
       return;
@@ -563,12 +592,17 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     }
 
     for (const directory of rememberedDirectories) approvedDirectories.add(directory);
-    if (typeof event.toolCallId === "string" && (temporaryCandidates.size > 0 || existingTemporaryNamespaces)) {
+    if (
+      typeof event.toolCallId === "string" &&
+      (temporaryCandidates.size > 0 || existingTemporaryNamespaces || temporaryTemplates.length > 0)
+    ) {
       pendingTemporaryChecks.set(event.toolCallId, {
         workspace: root,
         candidates: [...temporaryCandidates],
         temporaryRoot: existingTemporaryNamespaces ? config.temporaryRoot : undefined,
         existingNamespaces: existingTemporaryNamespaces,
+        temporaryTemplates,
+        ...(event.toolName === "eval" ? { acceptReportedNamespaces: true as const } : {}),
       });
     }
   });
@@ -618,14 +652,24 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
       const candidates = new Set(pending.candidates);
       if (pending.temporaryRoot && pending.existingNamespaces) {
         const currentNamespaces = await temporaryNamespaces(pending.temporaryRoot);
-        const reportedPaths = new Set(
-          event.content
-            .filter((item): item is { type: "text"; text: string } => item.type === "text")
-            .flatMap((item) => item.text.split(/\r?\n/).map((line) => line.trim())),
-        );
+        const reportedLines = event.content
+          .filter((item): item is { type: "text"; text: string } => item.type === "text")
+          .flatMap((item) => item.text.split(/\r?\n/).map((line) => line.trim()))
+          .filter(Boolean);
+        const reportedPaths = new Set(reportedLines);
         if (currentNamespaces) {
           for (const namespace of currentNamespaces) {
-            if (!pending.existingNamespaces.has(namespace) && reportedPaths.has(namespace)) candidates.add(namespace);
+            if (pending.existingNamespaces.has(namespace)) continue;
+            const templateReported = pending.temporaryTemplates?.some(({ template, base }) =>
+              matchesTemporaryTemplate(template, namespace) &&
+              reportedLines.some((line) => normalizedPath(line, base) === namespace)
+            ) === true;
+            if (
+              templateReported ||
+              (pending.acceptReportedNamespaces && reportedPaths.has(namespace))
+            ) {
+              candidates.add(namespace);
+            }
           }
         }
       }

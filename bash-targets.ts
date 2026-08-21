@@ -2,7 +2,7 @@ import { basename, isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
 
 export type BashTarget =
-  | { kind: "path"; value: string; base: string; creates?: true }
+  | { kind: "path"; value: string; base: string; creates?: true; temporaryTemplate?: true }
   | { kind: "opaque"; value: string }
   | { kind: "git-push" };
 
@@ -149,6 +149,11 @@ const GIT_CONFIG_OPTIONS_WITH_VALUE: Record<string, true> = {
   "--comment": true,
   "--default": true,
   "--type": true,
+};
+
+const MKTEMP_OPTIONS_WITH_VALUE: Record<string, true> = {
+  "--suffix": true,
+  "-p": true,
 };
 
 function tokenize(command: string): Token[] {
@@ -461,6 +466,17 @@ function commandTargets(words: string[], base: string | undefined): BashTarget[]
   if (Object.hasOwn(DIRECT_MUTATORS, command)) {
     const creates = command === "mkdir" || command === "touch" || command === "truncate";
     return argsWithoutOptions.map((value) => pathTarget(value, base, command, creates));
+  }
+  if (command === "mktemp") {
+    const locationIsImplicit = args.some((value) =>
+      value === "--tmpdir" || value.startsWith("--tmpdir=") || /^-[^-]*[pt]/.test(value)
+    );
+    if (locationIsImplicit) return [{ kind: "opaque", value: "mktemp output directory" }];
+    const template = positionalArguments(args, MKTEMP_OPTIONS_WITH_VALUE).at(-1);
+    if (!template) return [{ kind: "opaque", value: "mktemp output path" }];
+    const target = pathTarget(template, base, command, true);
+    if (target.kind !== "path" || !/X{3,}$/.test(basename(target.value))) return [target];
+    return [{ ...target, temporaryTemplate: true }];
   }
   if (Object.hasOwn(METADATA_MUTATORS, command)) {
     return argsWithoutOptions.slice(1).map((value) => pathTarget(value, base, command));

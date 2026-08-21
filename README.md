@@ -13,7 +13,7 @@ Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `e
 - Directory approvals reset when OMP restarts and are not shared across workspaces.
 - External writes that require confirmation but have not been approved are denied when no interactive UI is available.
 - Symbolic links are resolved before a directory is checked or remembered.
-- New temporary namespaces can receive process-local ownership according to the `temporary` policy. By default, a new `/tmp/<name>` namespace can be created without confirmation. After the tool successfully creates it, the same OMP process and workspace can modify or delete that namespace. `eval` can claim a namespace created by its code when the successful result reports the new path.
+- New temporary namespaces can receive process-local ownership according to the `temporary` policy. By default, a new `/tmp/<name>` namespace can be created without confirmation. After the tool successfully creates it, the same OMP process and workspace can modify or delete that namespace. `mktemp` can claim a namespace when its successful result reports a new path matching the explicit template; `eval` can claim one created by its code when the successful result reports the new path.
 - Existing temporary namespaces are never claimed automatically. Temporary ownership resets when OMP restarts and is not shared across workspaces.
 - When Bash is configured for automatic approval, the plugin still checks explicit write targets that can be identified on the command line.
 - `git push` has an independent policy and is denied by default.
@@ -232,7 +232,7 @@ The plugin intercepts:
 - LSP modification operations
 - Common Bash commands with explicit write targets
 
-Bash checks cover shell output redirection, `rm`, `rmdir`, `mkdir`, `touch`, `truncate`, `cp`, `mv`, `install`, `ln`, `chmod`, `chown`, `chgrp`, `tee`, `dd of=`, in-place `sed` and `perl`, and mutating Git commands. Structured Bash `cwd`, `cd`, Git `-C`, glob paths, home paths, and symbolic links are resolved before comparison. A new temporary namespace receives process-local ownership only after the tool result confirms that it was created. For `eval`, the plugin snapshots the configured temporary root and claims only a newly added top-level namespace whose exact path appears in the successful result.
+Bash checks cover shell output redirection, `rm`, `rmdir`, `mkdir`, `mktemp`, `touch`, `truncate`, `cp`, `mv`, `install`, `ln`, `chmod`, `chown`, `chgrp`, `tee`, `dd of=`, in-place `sed` and `perl`, and mutating Git commands. Structured Bash `cwd`, `cd`, Git `-C`, glob paths, home paths, and symbolic links are resolved before comparison. A new temporary namespace receives process-local ownership only after the tool result confirms that it was created. For `mktemp`, the plugin claims only a newly added top-level namespace whose exact reported path matches the explicit trailing-`X` template. For `eval`, it claims only a newly added top-level namespace whose exact path appears in the successful result.
 
 `git push` detection covers direct calls, wrappers, `git -C`, Git global options, and compound commands. `gitPush: "deny"` rejects immediately without opening a confirmation dialog. `"prompt"` requests separate confirmation. `"allow"` still preserves repository path checks.
 

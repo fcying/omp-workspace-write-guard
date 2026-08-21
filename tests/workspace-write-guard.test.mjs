@@ -768,6 +768,143 @@ test("owns a newly created temporary namespace for its lifecycle", async (t) => 
   assert.equal(deletion, undefined);
 });
 
+test("owns a temporary namespace reported by mktemp", async (t) => {
+  const { root, workspace, agentDir } = await fixture(t);
+  const temporaryRoot = join(root, "temporary");
+  const template = join(temporaryRoot, "ruff-env-test.XXXXXX");
+  const created = join(temporaryRoot, "ruff-env-test.aB3xY9");
+  await mkdir(temporaryRoot);
+  await writeConfig(join(workspace, ".omp"), { temporary: { root: temporaryRoot } });
+  const { call, result } = registerLifecycleHandlers(agentDir);
+
+  const creation = await call(
+    { toolCallId: "mktemp-create", toolName: "bash", input: { command: `command mktemp -d ${template}` } },
+    context(workspace),
+  );
+  await mkdir(created);
+  await result({
+    toolCallId: "mktemp-create",
+    toolName: "bash",
+    input: {},
+    isError: false,
+    content: [{ type: "text", text: `${created}\n` }],
+  });
+
+  const update = await call(
+    { toolCallId: "update-mktemp", toolName: "write", input: { path: join(created, "file.txt"), content: "ok" } },
+    context(workspace),
+  );
+  const deletion = await call(
+    { toolCallId: "delete-mktemp", toolName: "bash", input: { command: `rm -rf ${created}` } },
+    context(workspace),
+  );
+
+  assert.equal(creation, undefined);
+  assert.equal(update, undefined);
+  assert.equal(deletion, undefined);
+});
+
+test("does not claim failed, existing, unreported, mismatched, or external mktemp paths", async (t) => {
+  const { root, workspace, outside, agentDir } = await fixture(t);
+  const temporaryRoot = join(root, "temporary");
+  const template = join(temporaryRoot, "ruff-env-test.XXXXXX");
+  const existing = join(temporaryRoot, "ruff-env-test.Exist1");
+  const failed = join(temporaryRoot, "ruff-env-test.Failed");
+  const unreported = join(temporaryRoot, "ruff-env-test.Silent");
+  const mismatched = join(temporaryRoot, "other-temp.aB3xY9");
+  await mkdir(existing, { recursive: true });
+  await writeConfig(join(workspace, ".omp"), { temporary: { root: temporaryRoot } });
+  const { call, result } = registerLifecycleHandlers(agentDir);
+
+  await call(
+    { toolCallId: "mktemp-existing", toolName: "bash", input: { command: `mktemp -d ${template}` } },
+    context(workspace),
+  );
+  await result({
+    toolCallId: "mktemp-existing",
+    toolName: "bash",
+    input: {},
+    isError: false,
+    content: [{ type: "text", text: existing }],
+  });
+
+  await call(
+    { toolCallId: "mktemp-failed", toolName: "bash", input: { command: `mktemp -d ${template}` } },
+    context(workspace),
+  );
+  await mkdir(failed);
+  await result({
+    toolCallId: "mktemp-failed",
+    toolName: "bash",
+    input: {},
+    isError: true,
+    content: [{ type: "text", text: failed }],
+  });
+
+  await call(
+    { toolCallId: "mktemp-unreported", toolName: "bash", input: { command: `mktemp -d ${template}` } },
+    context(workspace),
+  );
+  await mkdir(unreported);
+  await result({
+    toolCallId: "mktemp-unreported",
+    toolName: "bash",
+    input: {},
+    isError: false,
+    content: [{ type: "text", text: "done" }],
+  });
+
+  await call(
+    { toolCallId: "mktemp-mismatched", toolName: "bash", input: { command: `mktemp -d ${template}` } },
+    context(workspace),
+  );
+  await mkdir(mismatched);
+  await result({
+    toolCallId: "mktemp-mismatched",
+    toolName: "bash",
+    input: {},
+    isError: false,
+    content: [{ type: "text", text: mismatched }],
+  });
+
+  const implicitCreation = await call(
+    { toolCallId: "mktemp-implicit", toolName: "bash", input: { command: "mktemp -t ruff-env-test.XXXXXX" } },
+    context(workspace),
+  );
+
+  const existingDeletion = await call(
+    { toolCallId: "delete-existing-mktemp", toolName: "bash", input: { command: `rm -rf ${existing}` } },
+    context(workspace),
+  );
+  const failedDeletion = await call(
+    { toolCallId: "delete-failed-mktemp", toolName: "bash", input: { command: `rm -rf ${failed}` } },
+    context(workspace),
+  );
+  const unreportedDeletion = await call(
+    { toolCallId: "delete-unreported-mktemp", toolName: "bash", input: { command: `rm -rf ${unreported}` } },
+    context(workspace),
+  );
+  const mismatchedDeletion = await call(
+    { toolCallId: "delete-mismatched-mktemp", toolName: "bash", input: { command: `rm -rf ${mismatched}` } },
+    context(workspace),
+  );
+  const externalCreation = await call(
+    {
+      toolCallId: "mktemp-external",
+      toolName: "bash",
+      input: { command: `mktemp -d ${join(outside, "ruff-env-test.XXXXXX")}` },
+    },
+    context(workspace),
+  );
+
+  assert.equal(existingDeletion.block, true);
+  assert.equal(failedDeletion.block, true);
+  assert.equal(unreportedDeletion.block, true);
+  assert.equal(mismatchedDeletion.block, true);
+  assert.equal(implicitCreation.block, true);
+  assert.equal(externalCreation.block, true);
+});
+
 test("owns a temporary namespace reported by eval", async (t) => {
   const { workspace, agentDir } = await fixture(t);
   const created = await mkdtemp(join(tmpdir(), "set-omp-test-"));
