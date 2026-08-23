@@ -100,6 +100,24 @@ test("blocks direct writes outside the workspace without a UI", async (t) => {
   assert.match(result.reason, /Write outside workspace blocked/);
   assert.match(result.reason, /outside\/file\.ts/);
 });
+test("allows writes to /dev/null without approving /dev", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const nullWrite = await handler(
+    { toolName: "write", input: { path: "/dev/null", content: "discarded" } },
+    context(workspace),
+  );
+  const otherDeviceWrite = await handler(
+    { toolName: "write", input: { path: "/dev/zero", content: "blocked" } },
+    context(workspace),
+  );
+
+  assert.equal(nullWrite, undefined);
+  assert.equal(otherDeviceWrite.block, true);
+  assert.match(otherDeviceWrite.reason, /\/dev\/zero/);
+});
+
 
 test("remembers an approved external directory for the current process", async (t) => {
   const { workspace, outside } = await fixture(t);

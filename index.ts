@@ -468,6 +468,7 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
         }
         if (target.access === "read") continue;
         if (
+          resolved === "/dev/null" ||
           isAllowedByConfig(resolved, config.allowPaths) ||
           isWithin(root, resolved) ||
           isApproved(resolved, approvedDirectories) ||

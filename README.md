@@ -9,6 +9,8 @@ Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `e
 - Reads from any location are allowed by default, except explicit access matched by configured `protectedPaths` or `protectedFiles` rules. No file names are protected by default.
 - Direct file modifications inside the current workspace are otherwise allowed by default.
 - Direct modifications outside the workspace follow the `externalWrites` policy and require interactive confirmation by default.
+- Writes to `/dev/null` are allowed without confirmation; all other device paths remain subject to the applicable policy.
+
 - After an external target is approved, the plugin remembers its real parent directory only for the current OMP process and workspace. Later writes to that directory or its descendants do not prompt again.
 - Directory approvals reset when OMP restarts and are not shared across workspaces.
 - External writes that require confirmation but have not been approved are denied when no interactive UI is available.
