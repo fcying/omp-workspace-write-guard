@@ -6,7 +6,7 @@
     "policy": "deny"
   },
   "protectedFiles": {
-    "names": [".env"],
+    "names": [],
     "policy": "prompt"
   },
   "temporary": {

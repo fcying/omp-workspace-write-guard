@@ -6,7 +6,7 @@ Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `e
 
 ## Behavior
 
-- Reads from any location are allowed by default, except explicit access matched by `protectedPaths` or `protectedFiles`. By default, direct reads and writes of a file named `.env` require confirmation.
+- Reads from any location are allowed by default, except explicit access matched by configured `protectedPaths` or `protectedFiles` rules. No file names are protected by default.
 - Direct file modifications inside the current workspace are otherwise allowed by default.
 - Direct modifications outside the workspace follow the `externalWrites` policy and require interactive confirmation by default.
 - After an external target is approved, the plugin remembers its real parent directory only for the current OMP process and workspace. Later writes to that directory or its descendants do not prompt again.
@@ -43,7 +43,7 @@ cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
     "policy": "deny"
   },
   "protectedFiles": {
-    "names": [".env"],
+    "names": [],
     "policy": "prompt"
   },
   "temporary": {
@@ -90,7 +90,7 @@ Default configuration:
     "policy": "deny"
   },
   "protectedFiles": {
-    "names": [".env"],
+    "names": [],
     "policy": "prompt"
   },
   "temporary": {
@@ -107,7 +107,7 @@ Fields:
 - `allowPaths`: File or directory paths that can be written without confirmation. Each entry permits only that path and its descendants.
 - `protectedPaths.paths`: File or directory paths whose explicit access is protected. Reads match the path and its descendants. Writes also match parent deletion or move operations that could contain a protected path. This takes precedence over the workspace, `allowPaths`, and session approvals. Set this to `[]` to disable path protection.
 - `protectedPaths.policy`: `"prompt"` or `"deny"`. `"prompt"` confirms every matching tool call and fails closed without an interactive UI; approval is not remembered. `"deny"` blocks immediately without opening a confirmation dialog.
-- `protectedFiles.names`: Exact file names whose explicit reads and writes are protected in any directory. Glob patterns and path separators are rejected. Set this to `[]` to disable the bundled `.env` rule.
+- `protectedFiles.names`: Exact file names whose explicit reads and writes are protected in any directory. Glob patterns and path separators are rejected. The default list is empty.
 - `protectedFiles.policy`: `"prompt"` or `"deny"`. `"prompt"` confirms every matching tool call and fails closed without an interactive UI; approval is not remembered. `"deny"` blocks immediately without opening a confirmation dialog.
 
 - `temporary.root`: The temporary root under which newly created namespaces can be claimed automatically.

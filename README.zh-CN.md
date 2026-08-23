@@ -6,7 +6,7 @@
 
 ## 行为
 
-- 任意位置的读取默认允许, 但 `protectedPaths` 或 `protectedFiles` 匹配的显式访问除外。默认情况下, 直接读取或写入名为 `.env` 的文件需要确认。
+- 任意位置的读取默认允许, 但显式配置的 `protectedPaths` 或 `protectedFiles` 规则匹配的访问除外。默认不保护任何文件名。
 - 当前工作区内的其他直接文件修改默认允许。
 - 工作区外的直接修改按 `externalWrites` 策略处理, 默认要求交互确认。
 - 外部目标通过确认后, 插件只在当前 OMP 进程和当前工作区内记住其真实父目录。后续写入该目录及其子目录不再提示。
@@ -43,7 +43,7 @@ cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
     "policy": "deny"
   },
   "protectedFiles": {
-    "names": [".env"],
+    "names": [],
     "policy": "prompt"
   },
   "temporary": {
@@ -90,7 +90,7 @@ JSON
     "policy": "deny"
   },
   "protectedFiles": {
-    "names": [".env"],
+    "names": [],
     "policy": "prompt"
   },
   "temporary": {
@@ -107,7 +107,7 @@ JSON
 - `allowPaths`: 自动允许写入的目录或文件路径。只允许该路径及其后代。
 - `protectedPaths.paths`: 保护显式访问的文件或目录路径。读取匹配该路径及其后代; 写入还匹配可能包含受保护路径的父目录删除或移动操作。优先级高于工作区、`allowPaths` 和会话授权。设置为 `[]` 可关闭路径保护。
 - `protectedPaths.policy`: `"prompt"` 或 `"deny"`。`"prompt"` 会为每次匹配的工具调用确认, 无交互 UI 时安全拒绝, 且不会记住批准; `"deny"` 直接拒绝且不打开确认框。
-- `protectedFiles.names`: 在任意目录中保护显式读写的精确文件名。不允许 glob 或路径分隔符。设置为 `[]` 可关闭包内默认的 `.env` 规则。
+- `protectedFiles.names`: 在任意目录中保护显式读写的精确文件名。不允许 glob 或路径分隔符。默认列表为空。
 - `protectedFiles.policy`: `"prompt"` 或 `"deny"`。`"prompt"` 会为每次匹配的工具调用确认, 无交互 UI 时安全拒绝, 且不会记住批准; `"deny"` 直接拒绝且不打开确认框。
 
 - `temporary.root`: 可自动认领新命名空间的临时根目录。

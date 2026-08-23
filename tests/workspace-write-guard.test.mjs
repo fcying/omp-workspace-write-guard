@@ -362,6 +362,9 @@ test("prompts for each explicit protected file read and write", async (t) => {
   const { workspace, agentDir } = await fixture(t);
   const protectedPath = join(workspace, ".env");
   await writeFile(protectedPath, "TOKEN=secret\n");
+  await writeConfig(join(workspace, ".omp"), {
+    protectedFiles: { names: [".env"], policy: "prompt" },
+  });
   const handler = registerHandler(agentDir);
   const prompts = [];
   const approvedContext = context(workspace, { hasUI: true, approve: true, prompts });
@@ -399,6 +402,9 @@ test("prompts for each explicit protected file read and write", async (t) => {
 
 test("fails closed for protected file prompts without a UI", async (t) => {
   const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), {
+    protectedFiles: { names: [".env"], policy: "prompt" },
+  });
   const handler = registerHandler(agentDir);
 
   const result = await handler(
@@ -461,7 +467,9 @@ test("denies protected files without prompting and resolves symbolic links", asy
   const alias = join(workspace, "settings.txt");
   await writeFile(protectedPath, "TOKEN=secret\n");
   await symlink(protectedPath, alias);
-  await writeConfig(join(workspace, ".omp"), { protectedFiles: { policy: "deny" } });
+  await writeConfig(join(workspace, ".omp"), {
+    protectedFiles: { names: [".env"], policy: "deny" },
+  });
   const handler = registerHandler(agentDir);
   const prompts = [];
 
@@ -482,9 +490,8 @@ test("denies protected files without prompting and resolves symbolic links", asy
   assert.equal(prompts.length, 0);
 });
 
-test("allows disabling the default protected file names", async (t) => {
+test("does not protect file names by default", async (t) => {
   const { workspace, agentDir } = await fixture(t);
-  await writeConfig(join(workspace, ".omp"), { protectedFiles: { names: [] } });
   const handler = registerHandler(agentDir);
 
   const read = await handler(
