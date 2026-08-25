@@ -15,6 +15,9 @@ Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `e
 - Directory approvals reset when OMP restarts and are not shared across workspaces.
 - External writes that require confirmation but have not been approved are denied when no interactive UI is available.
 - Symbolic links are resolved before a directory is checked or remembered.
+- A Bash command can remove its own directory created with `name=$(mktemp -d)` without external-write confirmation when automatic temporary ownership is enabled, `mktemp` uses the configured temporary root, and the cleanup uses `rm` or `rmdir` with the exact variable; other variable expansions remain unapproved explicit targets.
+- If this cleanup requires confirmation instead, approving it never remembers the temporary root or any of its descendants.
+
 - New temporary namespaces can receive process-local ownership according to the `temporary` policy. By default, a new `/tmp/<name>` namespace can be created without confirmation. After the tool successfully creates it, the same OMP process and workspace can modify or delete that namespace. `mktemp` can claim a namespace when its successful result reports a new path matching the explicit template; `eval` can claim one created by its code when the successful result reports the new path.
 - Existing temporary namespaces are never claimed automatically. Temporary ownership resets when OMP restarts and is not shared across workspaces.
 - When Bash is configured for automatic approval, the plugin still checks explicit write targets that can be identified on the command line.

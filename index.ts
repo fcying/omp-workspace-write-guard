@@ -40,7 +40,7 @@ const resolvedConfigs = new Map<string, Promise<ResolvedGuardConfig>>();
 type ToolInput = Record<string, unknown>;
 
 type Target =
-  | { kind: "path"; value: string; base?: string; creates?: true; access?: "read"; temporaryTemplate?: true }
+  | { kind: "path"; value: string; base?: string; creates?: true; access?: "read"; temporaryTemplate?: true; temporary?: true; display?: string }
   | { kind: "opaque"; value: string }
   | { kind: "git-push" };
 
@@ -469,6 +469,7 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
         if (target.access === "read") continue;
         if (
           resolved === "/dev/null" ||
+          target.temporary && config.values.temporary.allowOwned && resolved === config.temporaryRoot ||
           isAllowedByConfig(resolved, config.allowPaths) ||
           isWithin(root, resolved) ||
           isApproved(resolved, approvedDirectories) ||
@@ -502,7 +503,10 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
         }
 
         if (config.values.externalWrites !== "allow") {
-          external.push({ display: resolved, directory: await approvalDirectory(resolved) });
+          external.push({
+            display: target.display ?? resolved,
+            ...(target.temporary ? {} : { directory: await approvalDirectory(resolved) }),
+          });
         }
       } catch (error) {
         const fileProtected = config.protectedFileNames.has(basename(requested));
@@ -518,7 +522,7 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
         if (target.access === "read") continue;
         if (config.values.externalWrites !== "allow") {
           external.push({
-            display: error instanceof Error ? `${target.value} (${error.message})` : `${target.value} (unresolved)`,
+            display: error instanceof Error ? `${target.display ?? target.value} (${error.message})` : `${target.display ?? target.value} (unresolved)`,
           });
         }
       }

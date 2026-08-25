@@ -1,8 +1,16 @@
+import { homedir, tmpdir } from "node:os";
 import { basename, isAbsolute, resolve } from "node:path";
-import { homedir } from "node:os";
 
 export type BashTarget =
-  | { kind: "path"; value: string; base: string; creates?: true; temporaryTemplate?: true }
+  | {
+    kind: "path";
+    value: string;
+    base: string;
+    creates?: true;
+    temporaryTemplate?: true;
+    temporary?: true;
+    display?: string;
+  }
   | { kind: "opaque"; value: string }
   | { kind: "git-push" };
 
@@ -159,6 +167,7 @@ const MKTEMP_OPTIONS_WITH_VALUE: Record<string, true> = {
 function tokenize(command: string): Token[] {
   const tokens: Token[] = [];
   let word = "";
+
   let quote: "'" | '"' | undefined;
 
   const flush = (): void => {
@@ -206,6 +215,7 @@ function tokenize(command: string): Token[] {
     }
 
     const operator = OPERATORS.find((candidate) => command.startsWith(candidate, index));
+
     if (operator) {
       flush();
       tokens.push({ kind: "operator", value: operator });
@@ -455,7 +465,7 @@ function gitTargets(args: string[], base: string | undefined): BashTarget[] {
   return [...scopeTargets, pathTarget(".", gitBase, `git ${subcommand} working directory`)];
 }
 
-function commandTargets(words: string[], base: string | undefined): BashTarget[] {
+function commandTargets(words: string[], base: string | undefined, temporaryVariables: ReadonlySet<string>): BashTarget[] {
   const commandWords = unwrapCommand(words);
   if (commandWords.length === 0) return [];
 
@@ -465,7 +475,12 @@ function commandTargets(words: string[], base: string | undefined): BashTarget[]
 
   if (Object.hasOwn(DIRECT_MUTATORS, command)) {
     const creates = command === "mkdir" || command === "touch" || command === "truncate";
-    return argsWithoutOptions.map((value) => pathTarget(value, base, command, creates));
+    return argsWithoutOptions.flatMap((value) => {
+      const variableMatch = value.match(/^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$/);
+      const variable = variableMatch?.[1] ?? variableMatch?.[2];
+      if ((command === "rm" || command === "rmdir") && variable && temporaryVariables.has(variable)) return [];
+      return [pathTarget(value, base, command, creates)];
+    });
   }
   if (command === "mktemp") {
     const locationIsImplicit = args.some((value) =>
@@ -507,7 +522,14 @@ function commandTargets(words: string[], base: string | undefined): BashTarget[]
   return [];
 }
 
-function processSegment(tokens: Token[], base: string | undefined): { targets: BashTarget[]; nextBase?: string } {
+function processSegment(
+  tokens: Token[],
+  base: string | undefined,
+  temporaryVariables: Set<string>,
+  implicitTemporaryRoot: string | undefined,
+  persistsTemporaryVariables: boolean,
+  canCreateTemporary: boolean,
+): { targets: BashTarget[]; nextBase?: string } {
   const words: string[] = [];
   const targets: BashTarget[] = [];
 
@@ -531,8 +553,46 @@ function processSegment(tokens: Token[], base: string | undefined): { targets: B
     words.push(token.value);
   }
 
+  const assignmentName = words[0]?.match(/^([A-Za-z_][A-Za-z0-9_]*)=/)?.[1];
+  const assignmentOnlyMktemp = implicitTemporaryRoot !== undefined && assignmentName !== undefined && (
+    (words.length === 1 && words[0] === `${assignmentName}=$(mktemp -d)`) ||
+    (words.length === 2 && words[0] === `${assignmentName}=$(mktemp` && words[1] === "-d)")
+  );
+  if (assignmentOnlyMktemp && persistsTemporaryVariables && canCreateTemporary) {
+    const target = pathTarget(implicitTemporaryRoot, base, "mktemp output directory", true);
+    if (target.kind === "path") {
+      temporaryVariables.add(assignmentName);
+      targets.push({ ...target, temporary: true, display: `${assignmentName}=$(mktemp -d)` });
+    } else {
+      targets.push(target);
+    }
+  } else if (words.length > 0 && words.every((word) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(word))) {
+    for (const word of words) temporaryVariables.delete(word.slice(0, word.indexOf("=")));
+  }
 
   const commandWords = unwrapCommand(words);
+  if (["export", "readonly", "declare", "typeset"].includes(basename(commandWords[0] ?? ""))) {
+    for (const word of commandWords.slice(1)) {
+      const name = word.match(/^([A-Za-z_][A-Za-z0-9_]*)=/)?.[1];
+      if (name) temporaryVariables.delete(name);
+    }
+  }
+  const command = basename(commandWords[0] ?? "");
+  if (command === "printf") {
+    for (let index = 1; index < commandWords.length; index += 1) {
+      const option = commandWords[index];
+      const name = option === "-v" ? commandWords[index + 1] : option.startsWith("-v") ? option.slice(2) : undefined;
+      if (name?.match(/^[A-Za-z_][A-Za-z0-9_]*$/)) temporaryVariables.delete(name);
+      if (option === "-v") index += 1;
+    }
+  } else if (command === "read" || command === "mapfile" || command === "readarray" || command === "unset") {
+    for (const word of operands(commandWords.slice(1))) {
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) temporaryVariables.delete(word);
+    }
+  } else if (command === "eval" || command === "." || command === "source") {
+    temporaryVariables.clear();
+  }
+
   if (basename(commandWords[0] ?? "") === "cd") {
     const destination = operands(commandWords.slice(1))[0] ?? homedir();
     if (!base || hasDynamicExpansion(destination)) return { targets, nextBase: undefined };
@@ -543,7 +603,7 @@ function processSegment(tokens: Token[], base: string | undefined): { targets: B
     };
   }
 
-  targets.push(...commandTargets(words, base));
+  targets.push(...commandTargets(words, base, temporaryVariables));
   return { targets, nextBase: base };
 }
 
@@ -555,24 +615,39 @@ export function bashWriteTargets(command: string, sessionCwd: string, requestedC
       : resolve(sessionCwd, expandedCwd)
     : sessionCwd;
   const targets: BashTarget[] = [];
+  const temporaryVariables = new Set<string>();
+  const implicitTemporaryRoot = /\b(?:TMPDIR|TMP|TEMP)=/.test(command) ? undefined : tmpdir();
   let segment: Token[] = [];
 
-  const flush = (): void => {
+  let firstSegment = true;
+  const flush = (persistsTemporaryVariables = true): void => {
     if (segment.length === 0) return;
-    const result = processSegment(segment, base);
+    const result = processSegment(
+      segment,
+      base,
+      temporaryVariables,
+      implicitTemporaryRoot,
+      persistsTemporaryVariables,
+      firstSegment,
+    );
+    firstSegment = false;
     targets.push(...result.targets);
     base = result.nextBase;
     segment = [];
   };
 
+  let pipeline = false;
   for (const token of tokenize(command)) {
     if (token.kind === "operator" && Object.hasOwn(CONTROL_OPERATORS, token.value)) {
-      flush();
+      const childProcess = token.value === "|" || token.value === "|&" || token.value === "&";
+      flush(!childProcess && !pipeline);
+      if (childProcess || pipeline) temporaryVariables.clear();
+      pipeline = token.value === "|" || token.value === "|&";
     } else {
       segment.push(token);
     }
   }
-  flush();
+  flush(!pipeline);
 
   return targets;
 }

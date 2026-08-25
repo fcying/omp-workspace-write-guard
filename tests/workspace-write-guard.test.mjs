@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import workspaceWriteGuard from "../index.ts";
+
+const execFile = promisify(execFileCallback);
 
 
 function registerHandler(agentDir = join(tmpdir(), `omp-write-guard-test-agent-${process.pid}`)) {
@@ -73,6 +77,14 @@ function context(cwd, { hasUI = false, approve = false, prompts = [] } = {}) {
     },
   };
 }
+
+async function bashTemporaryValue(script, temporaryRoot) {
+  const { stdout } = await execFile("bash", ["-c", `${script}; printf '%s' "$tmp"`], {
+    env: { ...process.env, TMPDIR: temporaryRoot },
+  });
+  return stdout;
+}
+
 
 test("allows direct writes inside the workspace", async (t) => {
   const { workspace } = await fixture(t);
@@ -325,6 +337,266 @@ test("allows common Bash reads, project runners, and workspace writes", async (t
   for (const command of commands) {
     const result = await handler({ toolName: "bash", input: { command } }, context(workspace));
     assert.equal(result, undefined, command);
+  }
+});
+test("allows a same-command cleanup of an mktemp directory", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=$(mktemp -d) && rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result, undefined);
+});
+
+test("blocks cleanup through an unrelated shell variable", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'target=/outside && rm -rf "$target"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$target/);
+});
+
+test("blocks cleanup after an array assignment that does not run mktemp", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=(mktemp -d) && rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("blocks cleanup after command-scoped mktemp assignment", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=/outside; tmp=$(mktemp -d) true; rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("enforces protected paths for same-command mktemp cleanup", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), {
+    protectedPaths: { paths: [tmpdir()], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=$(mktemp -d) && rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /Protected path access denied/);
+});
+
+test("does not allow mktemp cleanup outside the configured temporary root", async (t) => {
+  const { root, workspace, agentDir } = await fixture(t);
+  const configuredRoot = join(root, "configured-temporary");
+  await mkdir(configuredRoot);
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "deny",
+    temporary: { root: configuredRoot },
+  });
+  const handler = registerHandler(agentDir);
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=$(mktemp -d) && rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /tmp=\$\(mktemp -d\)/);
+});
+
+test("does not auto-allow mktemp cleanup with an explicit temporary environment", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'TMPDIR=/tmp tmp=$(mktemp -d) && rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("blocks cleanup after multi-variable reassignment", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=$(mktemp -d); tmp=/outside other=value; rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("blocks cleanup after a piped mktemp assignment", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=/outside; tmp=$(mktemp -d) | true; rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("blocks cleanup after a final piped mktemp assignment", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=/outside; true | tmp=$(mktemp -d); rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("blocks cleanup after a background mktemp assignment", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=/outside; tmp=$(mktemp -d) & rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("blocks cleanup after exporting a reassigned temporary variable", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=$(mktemp -d); export tmp=/outside; rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("blocks cleanup after a skipped conditional mktemp assignment", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=/outside; false && tmp=$(mktemp -d); rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("blocks cleanup after printf rewrites a temporary variable", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=$(mktemp -d); printf -v tmp /outside; rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("blocks cleanup after read rewrites a temporary variable", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=$(mktemp -d); read tmp; rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("blocks cleanup after mapfile rewrites a temporary variable", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=$(mktemp -d); mapfile tmp; rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("blocks cleanup after readarray rewrites a temporary variable", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=$(mktemp -d); readarray tmp; rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /rm: \$tmp/);
+});
+
+test("matches Bash temporary-variable state before cleanup", async (t) => {
+  const { workspace } = await fixture(t);
+  const temporaryRoot = tmpdir();
+  const handler = registerHandler();
+  const cases = [
+    { script: "tmp=$(mktemp -d)", temporary: true, allowed: true },
+    { script: "tmp=/outside; false && tmp=$(mktemp -d)", temporary: false, allowed: false },
+    { script: "tmp=/outside; tmp=$(mktemp -d) | true", temporary: false, allowed: false },
+    { script: "tmp=/outside; true | tmp=$(mktemp -d)", temporary: false, allowed: false },
+    { script: "tmp=/outside; tmp=$(mktemp -d) & wait", temporary: false, allowed: false },
+    { script: "tmp=$(mktemp -d); tmp=/outside other=value", temporary: false, allowed: false },
+    { script: "tmp=$(mktemp -d); printf -v tmp /outside", temporary: false, allowed: false },
+    { script: "tmp=$(mktemp -d); read tmp </dev/null", temporary: false, allowed: false },
+    { script: "tmp=$(mktemp -d); export tmp=/outside", temporary: false, allowed: false },
+    { script: "tmp=$(mktemp -d); mapfile tmp </dev/null", temporary: false, allowed: false },
+    { script: "tmp=$(mktemp -d); readarray tmp </dev/null", temporary: false, allowed: false },
+    { script: "tmp=$(mktemp -d); unset tmp", temporary: false, allowed: false },
+  ];
+
+  for (const scenario of cases) {
+    const value = await bashTemporaryValue(scenario.script, temporaryRoot);
+    const result = await handler(
+      { toolName: "bash", input: { command: `${scenario.script}; rm -rf "$tmp"` } },
+      context(workspace),
+    );
+
+    assert.equal(value.startsWith(`${temporaryRoot}/`), scenario.temporary, scenario.script);
+    assert.equal(result === undefined, scenario.allowed, scenario.script);
+    if (value.startsWith(`${temporaryRoot}/`)) await rm(value, { recursive: true, force: true });
   }
 });
 
@@ -695,6 +967,41 @@ test("disables automatic temporary ownership when configured", async (t) => {
 
   assert.equal(result.block, true);
   assert.match(result.reason, /Write outside workspace blocked/);
+});
+
+test("blocks same-command mktemp cleanup when temporary ownership is disabled", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { temporary: { allowOwned: false } });
+  const handler = registerHandler(agentDir);
+
+  const result = await handler(
+    { toolName: "bash", input: { command: 'tmp=$(mktemp -d) && rm -rf "$tmp"' } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /tmp=\$\(mktemp -d\)/);
+});
+
+test("does not remember an approved automatic mktemp root", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { temporary: { allowOwned: false } });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+
+  const approved = await handler(
+    { toolName: "bash", input: { command: 'tmp=$(mktemp -d); rmdir "$tmp"' } },
+    context(workspace, { hasUI: true, approve: true, prompts }),
+  );
+  const laterWrite = await handler(
+    { toolName: "write", input: { path: join(tmpdir(), "workspace-write-guard-probe"), content: "blocked" } },
+    context(workspace),
+  );
+
+  assert.equal(approved, undefined);
+  assert.equal(prompts.length, 1);
+  assert.doesNotMatch(prompts[0].body, /Remember for this OMP process/);
+  assert.equal(laterWrite.block, true);
 });
 
 test("hard-blocks git push without prompting", async (t) => {
