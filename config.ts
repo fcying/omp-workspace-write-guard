@@ -22,6 +22,7 @@ export interface GuardConfig {
   temporary: {
     root: string;
     allowOwned: boolean;
+    allowAll: boolean;
   };
   gitPush: GitPushPolicy;
 }
@@ -40,6 +41,7 @@ type PartialGuardConfig = {
   temporary?: {
     root?: string;
     allowOwned?: boolean;
+    allowAll?: boolean;
   };
   gitPush?: GitPushPolicy;
 };
@@ -52,7 +54,7 @@ const CONFIG_KEYS: Record<string, true> = {
   temporary: true,
   gitPush: true,
 };
-const TEMPORARY_KEYS: Record<string, true> = { root: true, allowOwned: true };
+const TEMPORARY_KEYS: Record<string, true> = { root: true, allowOwned: true, allowAll: true };
 const PROTECTED_PATH_KEYS: Record<string, true> = { paths: true, policy: true };
 const PROTECTED_FILE_KEYS: Record<string, true> = { names: true, policy: true };
 
@@ -168,15 +170,20 @@ function parseConfig(value: unknown, source: string): PartialGuardConfig {
     }
     const root = rawTemporary.root;
     const allowOwned = rawTemporary.allowOwned;
+    const allowAll = rawTemporary.allowAll;
     if (root !== undefined && (typeof root !== "string" || root.trim() === "")) {
       throw new Error(`${source}: temporary.root must be a non-empty path`);
     }
     if (allowOwned !== undefined && typeof allowOwned !== "boolean") {
       throw new Error(`${source}: temporary.allowOwned must be boolean`);
     }
+    if (allowAll !== undefined && typeof allowAll !== "boolean") {
+      throw new Error(`${source}: temporary.allowAll must be boolean`);
+    }
     temporary = {
       ...(typeof root === "string" ? { root: configuredPath(root, "temporary.root", source) } : {}),
       ...(typeof allowOwned === "boolean" ? { allowOwned } : {}),
+      ...(typeof allowAll === "boolean" ? { allowAll } : {}),
     };
   }
 
@@ -227,6 +234,7 @@ function mergeConfig(base: GuardConfig, override: PartialGuardConfig): GuardConf
     temporary: {
       root: override.temporary?.root ?? base.temporary.root,
       allowOwned: override.temporary?.allowOwned ?? base.temporary.allowOwned,
+      allowAll: override.temporary?.allowAll ?? base.temporary.allowAll,
     },
     gitPush: override.gitPush ?? base.gitPush,
   };
@@ -240,7 +248,7 @@ export async function loadGuardConfig(agentDir: string, workspace: string): Prom
     allowPaths: [],
     protectedPaths: { paths: [], policy: "deny" },
     protectedFiles: { names: [], policy: "prompt" },
-    temporary: { root: "/tmp", allowOwned: true },
+    temporary: { root: "/tmp", allowOwned: true, allowAll: true },
     gitPush: "deny",
   }, bundled ?? {});
 

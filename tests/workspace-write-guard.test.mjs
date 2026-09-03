@@ -9,9 +9,10 @@ import { promisify } from "node:util";
 import workspaceWriteGuard from "../index.ts";
 
 const execFile = promisify(execFileCallback);
+const DEFAULT_AGENT_DIR = join(tmpdir(), `omp-write-guard-test-agent-${process.pid}`);
 
 
-function registerHandler(agentDir = join(tmpdir(), `omp-write-guard-test-agent-${process.pid}`)) {
+function registerHandler(agentDir = DEFAULT_AGENT_DIR) {
   let handler;
   const labels = [];
 
@@ -29,7 +30,7 @@ function registerHandler(agentDir = join(tmpdir(), `omp-write-guard-test-agent-$
   assert.deepEqual(labels, ["Workspace write guard"]);
   return handler;
 }
-function registerLifecycleHandlers(agentDir = join(tmpdir(), `omp-write-guard-test-agent-${process.pid}`)) {
+function registerLifecycleHandlers(agentDir = DEFAULT_AGENT_DIR) {
   let call;
   let result;
 
@@ -52,9 +53,13 @@ async function fixture(t) {
   const workspace = join(root, "workspace");
   const outside = join(root, "outside");
   const agentDir = join(root, "agent");
+  const temporaryRoot = join(root, "temporary");
   await mkdir(workspace);
   await mkdir(outside);
   await mkdir(agentDir);
+  await mkdir(temporaryRoot);
+  await writeConfig(agentDir, { temporary: { root: temporaryRoot } });
+  await writeConfig(DEFAULT_AGENT_DIR, { temporary: { root: temporaryRoot } });
   await symlink(outside, join(workspace, "external-link"));
   t.after(() => rm(root, { recursive: true, force: true }));
   return { root, workspace, outside, agentDir };
@@ -111,6 +116,22 @@ test("blocks direct writes outside the workspace without a UI", async (t) => {
   assert.equal(result.block, true);
   assert.match(result.reason, /Write outside workspace blocked/);
   assert.match(result.reason, /outside\/file\.ts/);
+});
+
+test("allows existing files below the default temporary root", async (t) => {
+  const { root, workspace } = await fixture(t);
+  const temporary = await mkdtemp(join(tmpdir(), "omp-write-guard-default-temporary-"));
+  const generated = join(temporary, "generated.json");
+  await writeFile(generated, "existing");
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+  const handler = registerHandler(join(root, "default-agent"));
+
+  const result = await handler(
+    { toolName: "bash", input: { command: `rm -f ${generated}` } },
+    context(workspace),
+  );
+
+  assert.equal(result, undefined);
 });
 test("allows writes to /dev/null without approving /dev", async (t) => {
   const { workspace } = await fixture(t);
@@ -340,8 +361,9 @@ test("allows common Bash reads, project runners, and workspace writes", async (t
   }
 });
 test("allows a same-command cleanup of an mktemp directory", async (t) => {
-  const { workspace } = await fixture(t);
-  const handler = registerHandler();
+  const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { temporary: { root: tmpdir(), allowAll: false } });
+  const handler = registerHandler(agentDir);
 
   const result = await handler(
     { toolName: "bash", input: { command: 'tmp=$(mktemp -d) && rm -rf "$tmp"' } },
@@ -569,9 +591,10 @@ test("blocks cleanup after readarray rewrites a temporary variable", async (t) =
 });
 
 test("matches Bash temporary-variable state before cleanup", async (t) => {
-  const { workspace } = await fixture(t);
+  const { workspace, agentDir } = await fixture(t);
   const temporaryRoot = tmpdir();
-  const handler = registerHandler();
+  await writeConfig(join(workspace, ".omp"), { temporary: { root: temporaryRoot, allowAll: false } });
+  const handler = registerHandler(agentDir);
   const cases = [
     { script: "tmp=$(mktemp -d)", temporary: true, allowed: true },
     { script: "tmp=/outside; false && tmp=$(mktemp -d)", temporary: false, allowed: false },
@@ -647,6 +670,63 @@ test("applies allowPaths, protectedPaths, and externalWrites precedence", async 
   assert.match(deniedUnlisted.reason, /denied by configuration/);
   assert.equal(prompts.length, 0);
 });
+
+test("keeps direct writes below a configured temporary root guarded when disabled", async (t) => {
+  const { root, workspace, agentDir } = await fixture(t);
+  const temporaryRoot = join(root, "temporary");
+  await writeFile(join(temporaryRoot, "generated.json"), "existing");
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "deny",
+    temporary: { root: temporaryRoot, allowAll: false },
+  });
+  const handler = registerHandler(agentDir);
+
+  const result = await handler(
+    { toolName: "write", input: { path: join(temporaryRoot, "generated.json"), content: "blocked" } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /denied by configuration/);
+});
+
+test("allows direct writes below a configured temporary root", async (t) => {
+  const { root, workspace, agentDir } = await fixture(t);
+  const temporaryRoot = join(root, "temporary");
+  const protectedTarget = join(temporaryRoot, "protected", "file.txt");
+  await mkdir(join(temporaryRoot, "protected"), { recursive: true });
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "deny",
+    protectedPaths: { paths: [join(temporaryRoot, "protected")], policy: "deny" },
+    temporary: { root: temporaryRoot, allowAll: true },
+  });
+  const handler = registerHandler(agentDir);
+
+  const directWrite = await handler(
+    { toolName: "write", input: { path: join(temporaryRoot, "generated.json"), content: "ok" } },
+    context(workspace),
+  );
+  const rootDeletion = await handler(
+    { toolName: "bash", input: { command: `rm -rf ${temporaryRoot}` } },
+    context(workspace),
+  );
+  const cleanup = await handler(
+    { toolName: "bash", input: { command: `rm -f ${join(temporaryRoot, "generated.json")}` } },
+    context(workspace),
+  );
+  const protectedWrite = await handler(
+    { toolName: "write", input: { path: protectedTarget, content: "no" } },
+    context(workspace),
+  );
+
+  assert.equal(directWrite, undefined);
+  assert.equal(cleanup, undefined);
+  assert.equal(rootDeletion.block, true);
+  assert.match(rootDeletion.reason, /denied by configuration/);
+  assert.equal(protectedWrite.block, true);
+  assert.match(protectedWrite.reason, /Protected path access denied/);
+});
+
 
 test("prompts for each explicit protected file read and write", async (t) => {
   const { workspace, agentDir } = await fixture(t);
@@ -1073,10 +1153,10 @@ test("reuses an approved directory for Bash targets", async (t) => {
 });
 
 test("owns a newly created temporary namespace for its lifecycle", async (t) => {
-  const { workspace } = await fixture(t);
-  const { call, result } = registerLifecycleHandlers();
-  const temporary = await mkdtemp(join(tmpdir(), "omp-owned-probe-"));
-  await rm(temporary, { recursive: true });
+  const { root, workspace, agentDir } = await fixture(t);
+  const { call, result } = registerLifecycleHandlers(agentDir);
+  await writeConfig(join(workspace, ".omp"), { temporary: { root: join(root, "temporary"), allowAll: false } });
+  const temporary = join(root, "temporary", "omp-owned-probe");
   t.after(() => rm(temporary, { recursive: true, force: true }));
 
   const creation = await call(
@@ -1105,8 +1185,7 @@ test("owns a temporary namespace reported by mktemp", async (t) => {
   const temporaryRoot = join(root, "temporary");
   const template = join(temporaryRoot, "ruff-env-test.XXXXXX");
   const created = join(temporaryRoot, "ruff-env-test.aB3xY9");
-  await mkdir(temporaryRoot);
-  await writeConfig(join(workspace, ".omp"), { temporary: { root: temporaryRoot } });
+  await writeConfig(join(workspace, ".omp"), { temporary: { root: temporaryRoot, allowAll: false } });
   const { call, result } = registerLifecycleHandlers(agentDir);
 
   const creation = await call(
@@ -1145,7 +1224,7 @@ test("does not claim failed, existing, unreported, mismatched, or external mktem
   const unreported = join(temporaryRoot, "ruff-env-test.Silent");
   const mismatched = join(temporaryRoot, "other-temp.aB3xY9");
   await mkdir(existing, { recursive: true });
-  await writeConfig(join(workspace, ".omp"), { temporary: { root: temporaryRoot } });
+  await writeConfig(join(workspace, ".omp"), { temporary: { root: temporaryRoot, allowAll: false } });
   const { call, result } = registerLifecycleHandlers(agentDir);
 
   await call(
@@ -1238,9 +1317,9 @@ test("does not claim failed, existing, unreported, mismatched, or external mktem
 });
 
 test("owns a temporary namespace reported by eval", async (t) => {
-  const { workspace, agentDir } = await fixture(t);
-  const created = await mkdtemp(join(tmpdir(), "set-omp-test-"));
-  await rm(created, { recursive: true });
+  const { root, workspace, agentDir } = await fixture(t);
+  const created = join(root, "temporary", "set-omp-test");
+  await writeConfig(join(workspace, ".omp"), { temporary: { root: join(root, "temporary"), allowAll: false } });
   t.after(() => rm(created, { recursive: true, force: true }));
   const { call, result } = registerLifecycleHandlers(agentDir);
 
@@ -1278,7 +1357,7 @@ test("does not claim pre-existing, failed, or unreported eval temporary namespac
   const failed = join(temporaryRoot, "failed");
   const unreported = join(temporaryRoot, "unreported");
   await mkdir(existing, { recursive: true });
-  await writeConfig(join(workspace, ".omp"), { temporary: { root: temporaryRoot } });
+  await writeConfig(join(workspace, ".omp"), { temporary: { root: temporaryRoot, allowAll: false } });
   const { call, result } = registerLifecycleHandlers(agentDir);
 
   await call(
@@ -1326,10 +1405,10 @@ test("does not claim pre-existing, failed, or unreported eval temporary namespac
 });
 
 test("does not claim existing or unsuccessfully created temporary namespaces", async (t) => {
-  const { workspace, outside } = await fixture(t);
-  const { call, result } = registerLifecycleHandlers();
-  const failed = await mkdtemp(join(tmpdir(), "omp-failed-probe-"));
-  await rm(failed, { recursive: true });
+  const { root, workspace, outside, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { temporary: { root: join(root, "temporary"), allowAll: false } });
+  const { call, result } = registerLifecycleHandlers(agentDir);
+  const failed = join(root, "temporary", "omp-failed-probe");
 
   const existingWrite = await call(
     { toolCallId: "existing-temp", toolName: "bash", input: { command: `touch ${join(outside, "file.txt")}` } },

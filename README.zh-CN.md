@@ -8,7 +8,7 @@
 
 - 任意位置的读取默认允许, 但显式配置的 `protectedPaths` 或 `protectedFiles` 规则匹配的访问除外。默认不保护任何文件名。
 - 当前工作区内的其他直接文件修改默认允许。
-- 工作区外的直接修改按 `externalWrites` 策略处理, 默认要求交互确认。
+- 工作区外的直接修改按 `externalWrites` 策略处理, 默认要求交互确认; 但启用 `temporary.allowAll` 时, `temporary.root` 严格后代的写入除外。
 - 对 `/dev/null` 的写入无需确认; 其他设备路径仍按适用策略处理。
 
 - 外部目标通过确认后, 插件只在当前 OMP 进程和当前工作区内记住其真实父目录。后续写入该目录及其子目录不再提示。
@@ -20,6 +20,7 @@
 
 - 新建临时命名空间可按 `temporary` 规则自动获得当前进程的临时所有权。默认允许新建 `/tmp/<name>`; 工具成功创建后, 同一进程和工作区可以修改或删除该命名空间。`mktemp` 成功结果报告了与显式模板匹配的新路径时可以认领该命名空间; `eval` 代码创建命名空间后, 成功结果报告新路径时也可以认领。
 - 既有临时命名空间不会被自动认领。临时所有权在 OMP 重启后清空, 也不会跨工作区共享。
+- `temporary.allowAll` 默认 `true`, 因此 `temporary.root` 严格后代中既有和新建路径的直接写入会绕过 `externalWrites`; 临时根目录自身仍受保护。显式 `protectedPaths` 和 `protectedFiles` 规则仍优先。
 - Bash 自动审批开启时, 插件仍检查命令行中可识别的显式写入目标。
 - `git push` 使用独立策略, 默认直接拒绝。
 
@@ -53,7 +54,8 @@ cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
   },
   "temporary": {
     "root": "/tmp",
-    "allowOwned": true
+    "allowOwned": true,
+    "allowAll": true
   },
   "gitPush": "deny"
 }
@@ -100,7 +102,8 @@ JSON
   },
   "temporary": {
     "root": "/tmp",
-    "allowOwned": true
+    "allowOwned": true,
+    "allowAll": true
   },
   "gitPush": "deny"
 }
@@ -117,6 +120,8 @@ JSON
 
 - `temporary.root`: 可自动认领新命名空间的临时根目录。
 - `temporary.allowOwned`: 是否启用临时命名空间自动认领。
+- `temporary.allowAll`: 允许直接写入 `temporary.root` 下的路径。默认 `true`; 显式保护规则仍优先。
+
 - `gitPush`: `"deny"`, `"prompt"`, `"allow"`。即使设为 `"allow"`, `git -C` 或 `--git-dir` 指向外部仓库时仍会执行外部路径检查。
 
 例如, 拒绝显式访问密钥及 XDG 配置路径, 交互确认 `.env` 和 `.env.local`, 自动允许一个共享构建目录, 禁用临时目录自动认领, 并让 `git push` 每次确认:
@@ -249,7 +254,7 @@ Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `mktemp`, `touc
 
 本插件用于防止误写, 不是操作系统沙箱。shell 解析器无法证明任意命令的实际副作用。
 
-自动批准 Bash 会信任 `just`, `make`, `npm`, `cargo`, Python 和项目二进制等 runner 或脚本。最终路径没有出现在工具参数中时, 它们可以读取受保护路径或文件, 或写入工作区外。命令替换、动态 shell 展开、被 source 的脚本、alias、函数、未知命令、目录搜索和 glob 搜索也有同样限制。临时根目录快照只能识别结果中报告的新命名空间, 不能审计代码的其他副作用。
+自动批准 Bash 会信任 `just`, `make`, `npm`, `cargo`, Python 和项目二进制等 runner 或脚本。最终路径没有出现在工具参数中时, 它们可以读取受保护路径或文件, 或写入工作区外。启用 `temporary.allowAll` 时, 指向 `temporary.root` 严格后代的显式写入也会有意绕过 `externalWrites`; 临时根目录自身不在此范围内。命令替换、动态 shell 展开、被 source 的脚本、alias、函数、未知命令、目录搜索和 glob 搜索也有同样限制。临时根目录快照只能识别结果中报告的新命名空间, 不能审计代码的其他副作用。
 
 需要强制文件系统边界时, 使用 Bubblewrap、容器或虚拟机。
 

@@ -11,7 +11,8 @@
   },
   "temporary": {
     "root": "/tmp",
-    "allowOwned": true
+    "allowOwned": true,
+    "allowAll": true
   },
   "gitPush": "deny"
 }

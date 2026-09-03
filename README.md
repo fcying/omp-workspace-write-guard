@@ -8,7 +8,7 @@ Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `e
 
 - Reads from any location are allowed by default, except explicit access matched by configured `protectedPaths` or `protectedFiles` rules. No file names are protected by default.
 - Direct file modifications inside the current workspace are otherwise allowed by default.
-- Direct modifications outside the workspace follow the `externalWrites` policy and require interactive confirmation by default.
+- Direct modifications outside the workspace follow the `externalWrites` policy and require interactive confirmation by default, except writes to strict descendants of `temporary.root` while `temporary.allowAll` is enabled.
 - Writes to `/dev/null` are allowed without confirmation; all other device paths remain subject to the applicable policy.
 
 - After an external target is approved, the plugin remembers its real parent directory only for the current OMP process and workspace. Later writes to that directory or its descendants do not prompt again.
@@ -20,6 +20,7 @@ Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `e
 
 - New temporary namespaces can receive process-local ownership according to the `temporary` policy. By default, a new `/tmp/<name>` namespace can be created without confirmation. After the tool successfully creates it, the same OMP process and workspace can modify or delete that namespace. `mktemp` can claim a namespace when its successful result reports a new path matching the explicit template; `eval` can claim one created by its code when the successful result reports the new path.
 - Existing temporary namespaces are never claimed automatically. Temporary ownership resets when OMP restarts and is not shared across workspaces.
+- `temporary.allowAll` defaults to `true`, so direct writes to pre-existing and new strict descendants of `temporary.root` bypass `externalWrites`; the temporary root itself remains guarded. Explicit `protectedPaths` and `protectedFiles` rules still take precedence.
 - When Bash is configured for automatic approval, the plugin still checks explicit write targets that can be identified on the command line.
 - `git push` has an independent policy and is denied by default.
 
@@ -53,7 +54,8 @@ cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
   },
   "temporary": {
     "root": "/tmp",
-    "allowOwned": true
+    "allowOwned": true,
+    "allowAll": true
   },
   "gitPush": "deny"
 }
@@ -100,7 +102,8 @@ Default configuration:
   },
   "temporary": {
     "root": "/tmp",
-    "allowOwned": true
+    "allowOwned": true,
+    "allowAll": true
   },
   "gitPush": "deny"
 }
@@ -117,6 +120,8 @@ Fields:
 
 - `temporary.root`: The temporary root under which newly created namespaces can be claimed automatically.
 - `temporary.allowOwned`: Enables automatic temporary namespace ownership.
+- `temporary.allowAll`: Allows direct writes below `temporary.root`. Defaults to `true`; explicit protected rules still take precedence.
+
 - `gitPush`: `"deny"`, `"prompt"`, or `"allow"`. Even when set to `"allow"`, external repository paths supplied through `git -C` or `--git-dir` still undergo external path checks.
 
 Example: deny explicit access to key and XDG configuration paths, protect `.env` and `.env.local` with an interactive prompt, allow a shared build directory, disable automatic temporary ownership, and prompt for every `git push`:
@@ -249,7 +254,7 @@ Arbitrary LSP `request` calls remain separately confirmed because a protocol req
 
 This plugin guards against accidental writes. It is not an operating-system sandbox. A shell parser cannot prove the actual side effects of an arbitrary command.
 
-Auto-approved Bash trusts project runners and scripts such as `just`, `make`, `npm`, `cargo`, Python, and project binaries. They can read protected paths or files, or write outside the workspace, when the final path is not visible in the tool arguments. Command substitution, dynamic shell expansion, sourced scripts, aliases, functions, unknown commands, directory searches, and glob searches have the same limitation. Temporary-root snapshots only identify reported new namespaces; they do not audit other code side effects.
+Auto-approved Bash trusts project runners and scripts such as `just`, `make`, `npm`, `cargo`, Python, and project binaries. They can read protected paths or files, or write outside the workspace, when the final path is not visible in the tool arguments. When `temporary.allowAll` is enabled, explicit writes to strict descendants of `temporary.root` also intentionally bypass `externalWrites`; the root itself does not. Command substitution, dynamic shell expansion, sourced scripts, aliases, functions, unknown commands, directory searches, and glob searches have the same limitation. Temporary-root snapshots only identify reported new namespaces; they do not audit other code side effects.
 
 Use Bubblewrap, a container, or a virtual machine when an enforceable filesystem boundary is required.
 

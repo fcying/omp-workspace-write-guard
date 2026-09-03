@@ -470,6 +470,7 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
         if (
           resolved === "/dev/null" ||
           target.temporary && config.values.temporary.allowOwned && resolved === config.temporaryRoot ||
+          config.values.temporary.allowAll && resolved !== config.temporaryRoot && isWithin(config.temporaryRoot, resolved) ||
           isAllowedByConfig(resolved, config.allowPaths) ||
           isWithin(root, resolved) ||
           isApproved(resolved, approvedDirectories) ||
