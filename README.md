@@ -181,9 +181,17 @@ omp config set tools.approval '{"bash":"allow","task":"allow","eval":"allow","hu
 
 These are executable tools. `bash`, `eval`, `browser.run`, background processes, and delegated agents can cause filesystem side effects that are not visible as explicit file targets. Use this set only for trusted repositories and commands. Unlike `yolo`, executable tools not listed here still require approval.
 
-OMP's own critical destructive-command guard can still require confirmation for operations such as `rm -r` and `rm -rf`. To remove a temporary tree already owned by the plugin without an additional prompt, remove files with non-recursive `rm` calls and then remove empty directories with `rmdir`.
+### Yolo with workspace protection
 
-Do not use `yolo` unless you accept that every executable tool can bypass path checks.
+For a trusted workspace that prioritizes low prompt volume, enable OMP's `yolo` mode and retain this plugin's policies:
+
+```bash
+omp config set tools.approvalMode yolo
+```
+
+OMP then skips its own tool and critical-command approval prompts, while this plugin still blocks or prompts for explicit targets it recognizes: `protectedPaths`, `protectedFiles`, external writes, and `git push` according to their configured policies. This permits cleanup of configured temporary-root descendants without OMP's `rm` critical prompt.
+
+This is not a sandbox. The plugin cannot prove filesystem effects hidden in scripts, project runners, `eval` subprocesses, command substitution, dynamic expansion, aliases, functions, or unknown programs. Use `yolo` only when that boundary is acceptable.
 
 ## Marketplace installation
 

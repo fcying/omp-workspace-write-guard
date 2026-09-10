@@ -181,9 +181,17 @@ omp config set tools.approval '{"bash":"allow","task":"allow","eval":"allow","hu
 
 这些都是可执行工具。`bash`、`eval`、`browser.run`、后台进程和委派 agent 都可能产生无法从显式文件目标中识别的文件系统副作用。只在可信仓库及命令中使用这组配置。与 `yolo` 不同, 未列出的其他可执行工具仍需确认。
 
-OMP 自身的高风险破坏命令保护仍可能要求确认, 例如 `rm -r` 和 `rm -rf`。若要无额外提示地删除插件已认领的临时目录, 可先用非递归 `rm` 删除文件, 再用 `rmdir` 删除空目录。
+### 使用工作区保护的 yolo
 
-不要使用 `yolo`, 除非你接受所有可执行工具都可能绕过路径检查。
+对于优先降低提示频率的可信工作区, 可启用 OMP 的 `yolo` 模式, 并保留本插件的策略:
+
+```bash
+omp config set tools.approvalMode yolo
+```
+
+OMP 会跳过自身的工具和高危命令审批提示, 但本插件仍会按配置对它识别到的显式目标拒绝或提示: `protectedPaths`、`protectedFiles`、外部写入和 `git push`。这样可清理配置的临时根目录后代, 而不会触发 OMP 的 `rm` 高危确认。
+
+这不是沙箱。插件无法证明隐藏在脚本、项目 runner、`eval` 子进程、命令替换、动态展开、alias、函数或未知程序中的文件系统副作用。只有接受这一边界时才使用 `yolo`。
 
 ## Marketplace 安装
 
