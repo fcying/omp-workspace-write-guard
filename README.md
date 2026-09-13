@@ -10,6 +10,7 @@ Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `e
 - Direct file modifications inside the current workspace are otherwise allowed by default.
 - Direct modifications outside the workspace follow the `externalWrites` policy and require interactive confirmation by default, except writes to strict descendants of `temporary.root` while `temporary.allowAll` is enabled.
 - Writes to `/dev/null` are allowed without confirmation; all other device paths remain subject to the applicable policy.
+- Writes to the standard OMP session directory for the current canonical workspace, `<agentDir>/sessions/<workspace-bucket>/`, are allowed without confirmation. Other workspace buckets remain external; explicit protection rules still take precedence.
 
 - After an external target is approved, the plugin remembers its real parent directory only for the current OMP process and workspace. Later writes to that directory or its descendants do not prompt again.
 - Directory approvals reset when OMP restarts and are not shared across workspaces.
@@ -57,6 +58,9 @@ cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
     "allowOwned": true,
     "allowAll": true
   },
+  "sessionDirectory": {
+    "allow": true
+  },
   "gitPush": "deny"
 }
 JSON
@@ -84,7 +88,7 @@ The file may contain only the fields that need to change. Unspecified fields inh
 
 Configuration files are strict JSON, not JSONC or YAML. Use double-quoted property names and strings; comments and trailing commas are invalid.
 
-Ordinary fields are overridden field by field. The `allowPaths`, `protectedPaths.paths`, and `protectedFiles.names` arrays are replaced as whole arrays. `temporary`, `protectedPaths`, and `protectedFiles` are merged by nested field. Relative paths are resolved from the active workspace, and `~` expands to the user's home directory. Path fields (`allowPaths`, `protectedPaths.paths`, and `temporary.root`) expand `$NAME` and `${NAME}` from the OMP process environment. Expansion occurs once; shell defaults such as `${NAME:-default}`, command substitution, `%NAME%`, and glob patterns are not supported. An undefined or empty referenced variable is a configuration error. Configuration is loaded and cached when the current OMP process first performs a protected operation. Restart OMP after changing the configuration or its referenced environment variables.
+Ordinary fields are overridden field by field. The `allowPaths`, `protectedPaths.paths`, and `protectedFiles.names` arrays are replaced as whole arrays. `temporary`, `sessionDirectory`, `protectedPaths`, and `protectedFiles` are merged by nested field. Relative paths are resolved from the active workspace, and `~` expands to the user's home directory. Path fields (`allowPaths`, `protectedPaths.paths`, and `temporary.root`) expand `$NAME` and `${NAME}` from the OMP process environment. Expansion occurs once; shell defaults such as `${NAME:-default}`, command substitution, `%NAME%`, and glob patterns are not supported. An undefined or empty referenced variable is a configuration error. Configuration is loaded and cached when the current OMP process first performs a protected operation. Restart OMP after changing the configuration or its referenced environment variables.
 
 Default configuration:
 
@@ -105,6 +109,9 @@ Default configuration:
     "allowOwned": true,
     "allowAll": true
   },
+  "sessionDirectory": {
+    "allow": true
+  },
   "gitPush": "deny"
 }
 ```
@@ -121,6 +128,7 @@ Fields:
 - `temporary.root`: The temporary root under which newly created namespaces can be claimed automatically.
 - `temporary.allowOwned`: Enables automatic temporary namespace ownership.
 - `temporary.allowAll`: Allows direct writes below `temporary.root`. Defaults to `true`; explicit protected rules still take precedence.
+- `sessionDirectory.allow`: Allows writes to the standard OMP session directory for the current workspace. Defaults to `true`; set it to `false` to apply `externalWrites` instead. Explicit protected rules still take precedence.
 
 - `gitPush`: `"deny"`, `"prompt"`, or `"allow"`. Even when set to `"allow"`, external repository paths supplied through `git -C` or `--git-dir` still undergo external path checks.
 

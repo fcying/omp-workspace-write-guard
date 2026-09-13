@@ -1,7 +1,7 @@
 import { loadGuardConfig, type GuardConfig } from "./config.ts";
 import { bashWriteTargets } from "./bash-targets.ts";
 import { lstat, readdir, readlink, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   basename,
   dirname,
@@ -289,6 +289,22 @@ function isWithin(root: string, target: string): boolean {
   const rel = relative(root, target);
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
+
+async function sessionDirectory(agentDir: string, workspace: string): Promise<string> {
+  const home = await canonicalPath(homedir(), workspace);
+  const homeRelative = relative(home, workspace);
+  let bucket: string;
+  if (homeRelative === "" || (homeRelative !== ".." && !homeRelative.startsWith(`..${sep}`) && !isAbsolute(homeRelative))) {
+    bucket = `-${homeRelative.split(sep).join("-")}`;
+  } else {
+    const temporary = await canonicalPath(tmpdir(), workspace);
+    const temporaryRelative = relative(temporary, workspace);
+    bucket = temporaryRelative !== ".." && !temporaryRelative.startsWith(`..${sep}`) && !isAbsolute(temporaryRelative)
+      ? `-tmp-${temporaryRelative.split(sep).join("-")}`
+      : `--${workspace.split(sep).filter(Boolean).join("-")}--`;
+  }
+  return join(await canonicalPath(join(agentDir, "sessions"), workspace), bucket);
+}
 async function approvalDirectory(target: string): Promise<string> {
   let staticPath = target;
   while (/[?*[{]/.test(basename(staticPath))) staticPath = dirname(staticPath);
@@ -395,6 +411,7 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
 
     let root: string;
     let config: ResolvedGuardConfig;
+    let projectSessionDirectory: string | undefined;
     try {
       root = await realpath(ctx.cwd);
       const key = `${agentDir}\0${root}`;
@@ -404,6 +421,9 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
         resolvedConfigs.set(key, pending);
       }
       config = await pending;
+      if (config.values.sessionDirectory.allow) {
+        projectSessionDirectory = await sessionDirectory(agentDir, root);
+      }
     } catch (error) {
       return {
         block: true,
@@ -472,6 +492,7 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
           target.temporary && config.values.temporary.allowOwned && resolved === config.temporaryRoot ||
           config.values.temporary.allowAll && resolved !== config.temporaryRoot && isWithin(config.temporaryRoot, resolved) ||
           isAllowedByConfig(resolved, config.allowPaths) ||
+          projectSessionDirectory !== undefined && isWithin(projectSessionDirectory, resolved) ||
           isWithin(root, resolved) ||
           isApproved(resolved, approvedDirectories) ||
           isApproved(resolved, ownedTemporaryPaths) ||

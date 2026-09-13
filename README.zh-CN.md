@@ -10,6 +10,7 @@
 - 当前工作区内的其他直接文件修改默认允许。
 - 工作区外的直接修改按 `externalWrites` 策略处理, 默认要求交互确认; 但启用 `temporary.allowAll` 时, `temporary.root` 严格后代的写入除外。
 - 对 `/dev/null` 的写入无需确认; 其他设备路径仍按适用策略处理。
+- 当前规范化工作区对应的标准 OMP 会话目录 `<agentDir>/sessions/<workspace-bucket>/` 可直接写入, 无需确认。其他工作区 bucket 仍属于外部目录; 显式保护规则仍优先。
 
 - 外部目标通过确认后, 插件只在当前 OMP 进程和当前工作区内记住其真实父目录。后续写入该目录及其子目录不再提示。
 - OMP 重启后清空目录授权; 不同工作区之间不共享授权。
@@ -57,6 +58,9 @@ cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
     "allowOwned": true,
     "allowAll": true
   },
+  "sessionDirectory": {
+    "allow": true
+  },
   "gitPush": "deny"
 }
 JSON
@@ -84,7 +88,7 @@ JSON
 
 配置文件必须是严格 JSON, 不是 JSONC 或 YAML。属性名和字符串必须使用双引号; 不允许注释或尾随逗号。
 
-普通字段逐字段覆盖; `allowPaths`、`protectedPaths.paths` 和 `protectedFiles.names` 数组整体替换; `temporary`、`protectedPaths` 和 `protectedFiles` 按子字段合并。相对路径以当前工作区为基准, `~` 会展开为用户主目录。路径字段 (`allowPaths`、`protectedPaths.paths` 和 `temporary.root`) 会从 OMP 进程环境展开 `$NAME` 和 `${NAME}`。只展开一次; 不支持 `${NAME:-default}` 等 shell 默认值、命令替换、`%NAME%` 或 glob。引用未定义或空值变量属于配置错误。配置在当前 OMP 进程首次执行受保护操作时加载并缓存; 修改配置或其引用的环境变量后需要重启 OMP。
+普通字段逐字段覆盖; `allowPaths`、`protectedPaths.paths` 和 `protectedFiles.names` 数组整体替换; `temporary`、`sessionDirectory`、`protectedPaths` 和 `protectedFiles` 按子字段合并。相对路径以当前工作区为基准, `~` 会展开为用户主目录。路径字段 (`allowPaths`、`protectedPaths.paths` 和 `temporary.root`) 会从 OMP 进程环境展开 `$NAME` 和 `${NAME}`。只展开一次; 不支持 `${NAME:-default}` 等 shell 默认值、命令替换、`%NAME%` 或 glob。引用未定义或空值变量属于配置错误。配置在当前 OMP 进程首次执行受保护操作时加载并缓存; 修改配置或其引用的环境变量后需要重启 OMP。
 
 默认配置:
 
@@ -105,6 +109,9 @@ JSON
     "allowOwned": true,
     "allowAll": true
   },
+  "sessionDirectory": {
+    "allow": true
+  },
   "gitPush": "deny"
 }
 ```
@@ -121,6 +128,7 @@ JSON
 - `temporary.root`: 可自动认领新命名空间的临时根目录。
 - `temporary.allowOwned`: 是否启用临时命名空间自动认领。
 - `temporary.allowAll`: 允许直接写入 `temporary.root` 下的路径。默认 `true`; 显式保护规则仍优先。
+- `sessionDirectory.allow`: 是否允许写入当前工作区对应的标准 OMP 会话目录。默认 `true`; 设置为 `false` 后改按 `externalWrites` 处理。显式保护规则仍优先。
 
 - `gitPush`: `"deny"`, `"prompt"`, `"allow"`。即使设为 `"allow"`, `git -C` 或 `--git-dir` 指向外部仓库时仍会执行外部路径检查。
 

@@ -1,6 +1,6 @@
 {
   "name": "omp-workspace-write-guard",
-  "version": "0.4.12",
+  "version": "0.4.13",
   "description": "Guard OMP workspace writes and explicit protected access.",
   "type": "module",
   "files": [

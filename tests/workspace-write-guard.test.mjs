@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { isAbsolute, join, relative, sep } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
@@ -10,6 +10,20 @@ import workspaceWriteGuard from "../index.ts";
 
 const execFile = promisify(execFileCallback);
 const DEFAULT_AGENT_DIR = join(tmpdir(), `omp-write-guard-test-agent-${process.pid}`);
+
+async function sessionBucket(workspace) {
+  workspace = await realpath(workspace);
+  const home = await realpath(homedir());
+  const homeRelative = relative(home, workspace);
+  if (homeRelative === "" || (homeRelative !== ".." && !homeRelative.startsWith(`..${sep}`) && !isAbsolute(homeRelative))) {
+    return `-${homeRelative.split(sep).join("-")}`;
+  }
+  const temporary = await realpath(tmpdir());
+  const temporaryRelative = relative(temporary, workspace);
+  return temporaryRelative !== ".." && !temporaryRelative.startsWith(`..${sep}`) && !isAbsolute(temporaryRelative)
+    ? `-tmp-${temporaryRelative.split(sep).join("-")}`
+    : `--${workspace.split(sep).filter(Boolean).join("-")}--`;
+}
 
 
 function registerHandler(agentDir = DEFAULT_AGENT_DIR) {
@@ -149,6 +163,72 @@ test("allows writes to /dev/null without approving /dev", async (t) => {
   assert.equal(nullWrite, undefined);
   assert.equal(otherDeviceWrite.block, true);
   assert.match(otherDeviceWrite.reason, /\/dev\/zero/);
+});
+
+test("allows writes to the current workspace session directory only", async (t) => {
+  const { root, workspace, agentDir } = await fixture(t);
+  const sessionStore = join(root, "session-store");
+  await mkdir(sessionStore);
+  await symlink(sessionStore, join(agentDir, "sessions"));
+  const sessionDirectory = join(agentDir, "sessions", await sessionBucket(workspace));
+  const handler = registerHandler(agentDir);
+
+  const currentSession = await handler(
+    { toolName: "write", input: { path: join(sessionDirectory, "session.jsonl"), content: "state" } },
+    context(workspace),
+  );
+  const otherSession = await handler(
+    { toolName: "write", input: { path: join(agentDir, "sessions", "-tmp-other-project", "session.jsonl"), content: "blocked" } },
+    context(workspace),
+  );
+
+  assert.equal(currentSession, undefined);
+  assert.equal(otherSession.block, true);
+});
+
+test("can disable writes to the current workspace session directory", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  const sessionDirectory = join(agentDir, "sessions", await sessionBucket(workspace));
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "deny",
+    sessionDirectory: { allow: false },
+  });
+  const handler = registerHandler(agentDir);
+
+  const result = await handler(
+    { toolName: "write", input: { path: join(sessionDirectory, "session.jsonl"), content: "blocked" } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+  assert.match(result.reason, /outside workspace denied by configuration/);
+});
+
+test("does not resolve the session directory when disabled", async (t) => {
+  const { root, workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), {
+    sessionDirectory: { allow: false },
+  });
+  const temporaryLoop = join(root, "temporary-loop");
+  await symlink("temporary-loop", temporaryLoop);
+  const previousHome = process.env.HOME;
+  const previousTemporary = process.env.TMPDIR;
+  process.env.HOME = join(root, "different-home");
+  process.env.TMPDIR = temporaryLoop;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousTemporary === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTemporary;
+  });
+  const handler = registerHandler(agentDir);
+
+  const result = await handler(
+    { toolName: "write", input: { path: "src/file.ts", content: "ok" } },
+    context(workspace),
+  );
+
+  assert.equal(result, undefined);
 });
 
 

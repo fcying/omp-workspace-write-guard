@@ -24,6 +24,9 @@ export interface GuardConfig {
     allowOwned: boolean;
     allowAll: boolean;
   };
+  sessionDirectory: {
+    allow: boolean;
+  };
   gitPush: GitPushPolicy;
 }
 
@@ -43,6 +46,9 @@ type PartialGuardConfig = {
     allowOwned?: boolean;
     allowAll?: boolean;
   };
+  sessionDirectory?: {
+    allow?: boolean;
+  };
   gitPush?: GitPushPolicy;
 };
 
@@ -53,8 +59,10 @@ const CONFIG_KEYS: Record<string, true> = {
   protectedFiles: true,
   temporary: true,
   gitPush: true,
+  sessionDirectory: true,
 };
 const TEMPORARY_KEYS: Record<string, true> = { root: true, allowOwned: true, allowAll: true };
+const SESSION_DIRECTORY_KEYS: Record<string, true> = { allow: true };
 const PROTECTED_PATH_KEYS: Record<string, true> = { paths: true, policy: true };
 const PROTECTED_FILE_KEYS: Record<string, true> = { names: true, policy: true };
 
@@ -187,6 +195,23 @@ function parseConfig(value: unknown, source: string): PartialGuardConfig {
     };
   }
 
+  let sessionDirectory: PartialGuardConfig["sessionDirectory"];
+  if (raw.sessionDirectory !== undefined) {
+    if (typeof raw.sessionDirectory !== "object" || raw.sessionDirectory === null || Array.isArray(raw.sessionDirectory)) {
+      throw new Error(`${source}: sessionDirectory must be an object`);
+    }
+    const rawSessionDirectory = raw.sessionDirectory as Record<string, unknown>;
+    for (const key of Object.keys(rawSessionDirectory)) {
+      if (!Object.hasOwn(SESSION_DIRECTORY_KEYS, key)) {
+        throw new Error(`${source}: unknown sessionDirectory setting ${key}`);
+      }
+    }
+    if (rawSessionDirectory.allow !== undefined && typeof rawSessionDirectory.allow !== "boolean") {
+      throw new Error(`${source}: sessionDirectory.allow must be boolean`);
+    }
+    sessionDirectory = typeof rawSessionDirectory.allow === "boolean" ? { allow: rawSessionDirectory.allow } : {};
+  }
+
   const externalWrites = policy(raw.externalWrites, "externalWrites", source);
   const allowPaths = pathList(raw.allowPaths, "allowPaths", source);
   const gitPush = policy(raw.gitPush, "gitPush", source);
@@ -196,6 +221,7 @@ function parseConfig(value: unknown, source: string): PartialGuardConfig {
     ...(protectedPaths ? { protectedPaths } : {}),
     ...(protectedFiles ? { protectedFiles } : {}),
     ...(temporary ? { temporary } : {}),
+    ...(sessionDirectory ? { sessionDirectory } : {}),
     ...(gitPush ? { gitPush } : {}),
   };
 }
@@ -236,6 +262,9 @@ function mergeConfig(base: GuardConfig, override: PartialGuardConfig): GuardConf
       allowOwned: override.temporary?.allowOwned ?? base.temporary.allowOwned,
       allowAll: override.temporary?.allowAll ?? base.temporary.allowAll,
     },
+    sessionDirectory: {
+      allow: override.sessionDirectory?.allow ?? base.sessionDirectory.allow,
+    },
     gitPush: override.gitPush ?? base.gitPush,
   };
 }
@@ -249,6 +278,7 @@ export async function loadGuardConfig(agentDir: string, workspace: string): Prom
     protectedPaths: { paths: [], policy: "deny" },
     protectedFiles: { names: [], policy: "prompt" },
     temporary: { root: "/tmp", allowOwned: true, allowAll: true },
+    sessionDirectory: { allow: true },
     gitPush: "deny",
   }, bundled ?? {});
 

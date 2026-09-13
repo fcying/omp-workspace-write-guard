@@ -14,5 +14,8 @@
     "allowOwned": true,
     "allowAll": true
   },
+  "sessionDirectory": {
+    "allow": true
+  },
   "gitPush": "deny"
 }
