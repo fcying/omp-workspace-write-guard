@@ -138,7 +138,7 @@ function writeTarget(raw: string, creates = false): Target | undefined {
   const wrapped = raw.match(/^\[(.*)#[0-9A-F]{4}\]$/);
   const value = cleanPath(wrapped?.[1] ?? raw);
 
-  if (value.startsWith("xd://") || value.startsWith("local://")) return undefined;
+  if (value.startsWith("xd://") || value.startsWith("local://") || value.startsWith("agent://")) return undefined;
   if (value.startsWith("file://")) {
     try {
       const target = { kind: "path" as const, value: fileURLToPath(value) };

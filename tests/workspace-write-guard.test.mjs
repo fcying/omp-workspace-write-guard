@@ -336,6 +336,25 @@ test("guards AST edit scopes, allows internal devices, and rejects unknown devic
   assert.equal(unknown.block, true);
 });
 
+test("allows agent messages without external-write confirmation", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+  const prompts = [];
+
+  const interactive = await handler(
+    { toolName: "write", input: { path: "agent://QualityProtocol", content: "message" } },
+    context(workspace, { hasUI: true, prompts }),
+  );
+  const unattended = await handler(
+    { toolName: "write", input: { path: "agent://QualityProtocol", content: "message" } },
+    context(workspace),
+  );
+
+  assert.equal(interactive, undefined);
+  assert.deepEqual(prompts, []);
+  assert.equal(unattended, undefined);
+});
+
 test("checks conflict resources against their registered file paths", async (t) => {
   const { workspace, outside, agentDir } = await fixture(t);
   const { call, result } = registerLifecycleHandlers(agentDir);
