@@ -19,6 +19,7 @@ const PATCH_FILE = /^\*\*\* (Add|Update|Delete) File:\s*(.+)\s*$/gm;
 const PATCH_MOVE = /^\*\*\* Move to:\s*(.+)\s*$/gm;
 const EDIT_MOVE = /^MV\s+(.+?)\s*$/gm;
 const ARCHIVE_OR_DB = /^(.*\.(?:tar\.gz|tgz|tar|zip|jar|war|ear|apk|sqlite|sqlite3|db|db3)):/i;
+const UNGUARDED_INTERNAL_URL = /^(?:agent|artifact|attachment|history|issue|local|memory|omp|pr|proc|rule|security|skill|xd):\/\//;
 const MUTATING_LSP_ACTIONS: Record<string, true> = {
   rename: true,
   rename_file: true,
@@ -138,7 +139,7 @@ function writeTarget(raw: string, creates = false): Target | undefined {
   const wrapped = raw.match(/^\[(.*)#[0-9A-F]{4}\]$/);
   const value = cleanPath(wrapped?.[1] ?? raw);
 
-  if (value.startsWith("xd://") || value.startsWith("local://") || value.startsWith("agent://")) return undefined;
+  if (UNGUARDED_INTERNAL_URL.test(value)) return undefined;
   if (value.startsWith("file://")) {
     try {
       const target = { kind: "path" as const, value: fileURLToPath(value) };

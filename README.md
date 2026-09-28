@@ -262,7 +262,7 @@ Bash checks cover shell output redirection, `rm`, `rmdir`, `mkdir`, `mktemp`, `t
 
 `git push` detection covers direct calls, wrappers, `git -C`, Git global options, and compound commands. `gitPush: "deny"` rejects immediately without opening a confirmation dialog. `"prompt"` requests separate confirmation. `"allow"` still preserves repository path checks.
 
-Regular files, archive entries, and SQLite row writes are evaluated using their underlying file paths. `local://`, `xd://`, and `agent://` are OMP internal resources and are not treated as external files. `conflict://` writes are evaluated using the underlying conflict files registered by the current session.
+Regular files, archive entries, SQLite row writes, and `file://` URLs are evaluated using their underlying file paths. `conflict://` writes are evaluated using the underlying conflict files registered by the current session. `local://`, `xd://`, `agent://`, and `proc://` bypass filesystem-path checks. Known read-only resources (`artifact://`, `attachment://`, `history://`, `issue://`, `memory://`, `omp://`, `pr://`, `rule://`, `security://`, and `skill://`) do not trigger external-write prompts; OMP rejects writes to them. `cfg://`, `mcp://`, `ssh://`, `vault://`, and unknown schemes remain guarded as opaque targets rather than assumed safe.
 
 Arbitrary LSP `request` calls remain separately confirmed because a protocol request can trigger server-initiated workspace edits whose complete targets are unavailable before execution.
 
@@ -271,6 +271,8 @@ Arbitrary LSP `request` calls remain separately confirmed because a protocol req
 This plugin guards against accidental writes. It is not an operating-system sandbox. A shell parser cannot prove the actual side effects of an arbitrary command.
 
 Auto-approved Bash trusts project runners and scripts such as `just`, `make`, `npm`, `cargo`, Python, and project binaries. They can read protected paths or files, or write outside the workspace, when the final path is not visible in the tool arguments. When `temporary.allowAll` is enabled, explicit writes to strict descendants of `temporary.root` also intentionally bypass `externalWrites`; the root itself does not. Command substitution, dynamic shell expansion, sourced scripts, aliases, functions, unknown commands, directory searches, and glob searches have the same limitation. Temporary-root snapshots only identify reported new namespaces; they do not audit other code side effects.
+
+Sending input to a process through `proc://` can execute commands and modify files outside the workspace. The guard does not inspect process input for filesystem side effects.
 
 Use Bubblewrap, a container, or a virtual machine when an enforceable filesystem boundary is required.
 

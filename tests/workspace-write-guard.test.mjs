@@ -355,6 +355,68 @@ test("allows agent messages without external-write confirmation", async (t) => {
   assert.equal(unattended, undefined);
 });
 
+test("allows process control without external-write confirmation", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+  const prompts = [];
+
+  for (const input of [
+    { path: "proc://za-shell", content: "input" },
+    { path: "proc://za-shell/kill" },
+    { path: "proc://za-shell/mode", content: "persist" },
+  ]) {
+    const interactive = await handler(
+      { toolName: "write", input },
+      context(workspace, { hasUI: true, prompts }),
+    );
+    const unattended = await handler(
+      { toolName: "write", input },
+      context(workspace),
+    );
+
+    assert.equal(interactive, undefined);
+    assert.equal(unattended, undefined);
+  }
+  assert.deepEqual(prompts, []);
+});
+
+test("skips external-write prompts for read-only internal resources", async (t) => {
+  const { workspace } = await fixture(t);
+  const handler = registerHandler();
+  const prompts = [];
+  const readOnly = ["artifact", "attachment", "history", "issue", "memory", "omp", "pr", "rule", "security", "skill"];
+
+  for (const scheme of readOnly) {
+    const result = await handler(
+      { toolName: "write", input: { path: `${scheme}://item`, content: "not writable" } },
+      context(workspace, { hasUI: true, prompts }),
+    );
+    assert.equal(result, undefined);
+  }
+  assert.deepEqual(prompts, []);
+});
+
+test("keeps file-backed and extensible resource writes guarded", async (t) => {
+  const { workspace, outside } = await fixture(t);
+  const handler = registerHandler();
+
+  for (const path of [
+    `file://${join(outside, "file.txt")}`,
+    "cfg://model",
+    "mcp://resource",
+    "ssh://host/file",
+    "vault://secret",
+    "unknown://target",
+  ]) {
+    const result = await handler(
+      { toolName: "write", input: { path, content: "blocked" } },
+      context(workspace),
+    );
+    assert.equal(result.block, true);
+    assert.match(result.reason, /Write outside workspace blocked/);
+  }
+});
+
 test("checks conflict resources against their registered file paths", async (t) => {
   const { workspace, outside, agentDir } = await fixture(t);
   const { call, result } = registerLifecycleHandlers(agentDir);

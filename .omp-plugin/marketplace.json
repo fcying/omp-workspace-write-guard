@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "OMP plugins maintained by fcying.",
-    "version": "0.4.14"
+    "version": "0.4.15"
   },
   "plugins": [
     {
       "name": "omp-workspace-write-guard",
       "description": "Guard workspace writes and explicit protected access with configurable policies.",
-      "version": "0.4.14",
+      "version": "0.4.15",
       "source": "./",
       "author": {
         "name": "fcying"

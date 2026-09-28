@@ -262,7 +262,7 @@ Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `mktemp`, `touc
 
 `git push` 检测覆盖直接调用、wrapper、`git -C`、Git 全局选项和复合命令。`gitPush: "deny"` 时立即拒绝且不打开确认框; `"prompt"` 时独立确认; `"allow"` 时仍保留仓库路径检查。
 
-普通文件、归档条目和 SQLite 行写入按其底层文件路径判断。`local://`, `xd://` 和 `agent://` 是 OMP 内部资源, 不作为外部文件处理。`conflict://` 写入按当前会话登记的底层冲突文件路径判断。
+普通文件、归档条目、SQLite 行写入和 `file://` URL 按其底层文件路径判断。`conflict://` 写入按当前会话登记的底层冲突文件路径判断。`local://`, `xd://`, `agent://` 和 `proc://` 不做文件路径检查。已知只读资源 (`artifact://`, `attachment://`, `history://`, `issue://`, `memory://`, `omp://`, `pr://`, `rule://`, `security://`, `skill://`) 不触发外部写入提示; OMP 会拒绝对它们的写入。`cfg://`, `mcp://`, `ssh://`, `vault://` 和未知前缀仍按不透明目标保守处理。
 
 任意 LSP `request` 仍单独确认, 因为协议请求可能触发服务端工作区编辑, 而执行前无法获得完整目标列表。
 
@@ -271,6 +271,8 @@ Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `mktemp`, `touc
 本插件用于防止误写, 不是操作系统沙箱。shell 解析器无法证明任意命令的实际副作用。
 
 自动批准 Bash 会信任 `just`, `make`, `npm`, `cargo`, Python 和项目二进制等 runner 或脚本。最终路径没有出现在工具参数中时, 它们可以读取受保护路径或文件, 或写入工作区外。启用 `temporary.allowAll` 时, 指向 `temporary.root` 严格后代的显式写入也会有意绕过 `externalWrites`; 临时根目录自身不在此范围内。命令替换、动态 shell 展开、被 source 的脚本、alias、函数、未知命令、目录搜索和 glob 搜索也有同样限制。临时根目录快照只能识别结果中报告的新命名空间, 不能审计代码的其他副作用。
+
+通过 `proc://` 向进程发送输入可能执行命令并修改工作区外的文件。guard 不检查进程输入的文件系统副作用。
 
 需要强制文件系统边界时, 使用 Bubblewrap、容器或虚拟机。
 
