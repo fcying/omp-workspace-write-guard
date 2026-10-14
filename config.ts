@@ -6,10 +6,12 @@ export const CONFIG_FILE_NAME = "workspace-write-guard.json";
 
 export type ExternalWritePolicy = "allow" | "deny" | "prompt";
 export type GitPushPolicy = "allow" | "deny" | "prompt";
+export type LspRequestPolicy = "allow" | "deny" | "prompt";
 export type ProtectedAccessPolicy = "deny" | "prompt";
 
 export interface GuardConfig {
   externalWrites: ExternalWritePolicy;
+  lspRequests: LspRequestPolicy;
   allowPaths: string[];
   protectedPaths: {
     paths: string[];
@@ -32,6 +34,7 @@ export interface GuardConfig {
 
 type PartialGuardConfig = {
   externalWrites?: ExternalWritePolicy;
+  lspRequests?: LspRequestPolicy;
   allowPaths?: string[];
   protectedPaths?: {
     paths?: string[];
@@ -54,6 +57,7 @@ type PartialGuardConfig = {
 
 const CONFIG_KEYS: Record<string, true> = {
   externalWrites: true,
+  lspRequests: true,
   allowPaths: true,
   protectedPaths: true,
   protectedFiles: true,
@@ -215,6 +219,7 @@ function parseConfig(value: unknown, source: string): PartialGuardConfig {
   const externalWrites = policy(raw.externalWrites, "externalWrites", source);
   const allowPaths = pathList(raw.allowPaths, "allowPaths", source);
   const gitPush = policy(raw.gitPush, "gitPush", source);
+  const lspRequests = policy(raw.lspRequests, "lspRequests", source);
   return {
     ...(externalWrites ? { externalWrites } : {}),
     ...(allowPaths ? { allowPaths } : {}),
@@ -223,6 +228,7 @@ function parseConfig(value: unknown, source: string): PartialGuardConfig {
     ...(temporary ? { temporary } : {}),
     ...(sessionDirectory ? { sessionDirectory } : {}),
     ...(gitPush ? { gitPush } : {}),
+    ...(lspRequests ? { lspRequests } : {}),
   };
 }
 
@@ -248,6 +254,7 @@ async function readConfig(path: string, required: boolean): Promise<PartialGuard
 function mergeConfig(base: GuardConfig, override: PartialGuardConfig): GuardConfig {
   return {
     externalWrites: override.externalWrites ?? base.externalWrites,
+    lspRequests: override.lspRequests ?? base.lspRequests,
     allowPaths: override.allowPaths ?? base.allowPaths,
     protectedPaths: {
       paths: override.protectedPaths?.paths ?? base.protectedPaths.paths,
@@ -274,6 +281,7 @@ export async function loadGuardConfig(agentDir: string, workspace: string): Prom
   const bundled = await readConfig(bundledPath, true);
   let config = mergeConfig({
     externalWrites: "prompt",
+    lspRequests: "allow",
     allowPaths: [],
     protectedPaths: { paths: [], policy: "deny" },
     protectedFiles: { names: [], policy: "prompt" },

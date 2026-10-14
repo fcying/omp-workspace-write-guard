@@ -24,7 +24,6 @@ const MUTATING_LSP_ACTIONS: Record<string, true> = {
   rename: true,
   rename_file: true,
   code_actions: true,
-  request: true,
 };
 const approvedDirectoriesByWorkspace = new Map<string, Set<string>>();
 const ownedTemporaryPathsByWorkspace = new Map<string, Set<string>>();
@@ -214,7 +213,6 @@ function targetsFor(toolName: string, input: ToolInput, cwd: string, conflictPat
     if (!Object.hasOwn(MUTATING_LSP_ACTIONS, action)) return [];
     if (action === "code_actions" && input.apply !== true) return [];
     if ((action === "rename" || action === "rename_file") && input.apply === false) return [];
-    if (action === "request") return [{ kind: "opaque", value: "LSP request" }];
 
     const paths = strings(input.file).map((value) => ({ kind: "path" as const, value }));
     if (action === "rename_file") {
@@ -405,10 +403,11 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     }
 
     const targets = targetsFor(event.toolName, input, ctx.cwd, conflictPaths);
+    const lspRequest = event.toolName === "lsp" && input.action === "request";
     const observesTemporary = event.toolName === "eval" || targets.some((target) =>
       target.kind === "path" && target.temporaryTemplate === true
     );
-    if (targets.length === 0 && !observesTemporary) return;
+    if (targets.length === 0 && !observesTemporary && !lspRequest) return;
 
     let root: string;
     let config: ResolvedGuardConfig;
@@ -430,6 +429,23 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
         block: true,
         reason: `Workspace write guard configuration error: ${error instanceof Error ? error.message : String(error)}`,
       };
+    }
+
+    if (lspRequest) {
+      if (config.values.lspRequests === "allow") return;
+      if (config.values.lspRequests === "deny") {
+        return { block: true, reason: "LSP request denied by workspace write guard configuration" };
+      }
+      if (!ctx.hasUI) {
+        return { block: true, reason: "LSP request blocked without interactive approval" };
+      }
+      const method = typeof input.query === "string" && input.query.length > 0 ? input.query : "(unspecified)";
+      const approved = await ctx.ui.confirm(
+        "Allow LSP request?",
+        `Workspace: ${root}\n\nMethod: ${method}\n\nThis request may trigger server-initiated edits outside the workspace.`,
+      );
+      if (!approved) return { block: true, reason: `User denied LSP request: ${method}` };
+      return;
     }
 
 

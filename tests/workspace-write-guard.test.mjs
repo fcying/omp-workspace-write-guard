@@ -501,6 +501,124 @@ test("allows workspace LSP changes and guards external destinations", async (t) 
   assert.match(externalMutation.reason, /outside\/file\.ts/);
 });
 
+test("allows raw LSP requests by default while guarding external file writes", async (t) => {
+  const { workspace, outside, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { externalWrites: "deny" });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+  const event = { toolName: "lsp", input: { action: "request", query: "workspace/executeCommand", file: "src/file.ts" } };
+
+  const interactive = await handler(event, context(workspace, { hasUI: true, prompts }));
+  const headless = await handler(event, context(workspace));
+  const external = await handler(
+    { toolName: "write", input: { path: join(outside, "file.ts"), content: "blocked" } },
+    context(workspace),
+  );
+
+  assert.equal(interactive, undefined);
+  assert.equal(headless, undefined);
+  assert.deepEqual(prompts, []);
+  assert.equal(external.block, true);
+});
+
+test("prompts for every raw LSP request independently of external writes", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { lspRequests: "prompt", externalWrites: "allow" });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+  const event = { toolName: "lsp", input: { action: "request", query: "textDocument/hover", file: "src/file.ts" } };
+
+  const headless = await handler(event, context(workspace));
+  const denied = await handler(event, context(workspace, { hasUI: true, prompts }));
+  const approved = await handler(event, context(workspace, { hasUI: true, approve: true, prompts }));
+  const repeated = await handler(event, context(workspace, { hasUI: true, prompts }));
+
+  assert.equal(headless.block, true);
+  assert.equal(denied.block, true);
+  assert.equal(approved, undefined);
+  assert.equal(repeated.block, true);
+  assert.equal(prompts.length, 3);
+});
+
+test("allows project-configured LSP requests without relaxing path protection", async (t) => {
+  const { root, workspace, outside, agentDir } = await fixture(t);
+  await writeConfig(agentDir, {
+    lspRequests: "deny",
+    temporary: { root: join(root, "temporary") },
+  });
+  await writeConfig(join(workspace, ".omp"), {
+    lspRequests: "allow",
+    externalWrites: "deny",
+    protectedFiles: { names: [".env"], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+  const request = await handler(
+    { toolName: "lsp", input: { action: "request", query: "workspace/executeCommand", file: "src/file.ts" } },
+    context(workspace, { hasUI: true, prompts }),
+  );
+  const headless = await handler(
+    { toolName: "lsp", input: { action: "request", query: "textDocument/hover", file: "src/file.ts" } },
+    context(workspace),
+  );
+  const externalWrite = await handler(
+    { toolName: "write", input: { path: join(outside, "file.ts"), content: "blocked" } },
+    context(workspace),
+  );
+  const externalRename = await handler(
+    { toolName: "lsp", input: { action: "rename_file", file: "src/file.ts", new_name: join(outside, "renamed.ts") } },
+    context(workspace),
+  );
+  const protectedAction = await handler(
+    { toolName: "lsp", input: { action: "code_actions", file: ".env", apply: true, query: "fix" } },
+    context(workspace),
+  );
+
+  assert.equal(request, undefined);
+  assert.equal(headless, undefined);
+  assert.deepEqual(prompts, []);
+  assert.equal(externalWrite.block, true);
+  assert.equal(externalRename.block, true);
+  assert.equal(protectedAction.block, true);
+});
+
+test("denies raw LSP requests without prompting or blocking known local changes", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { lspRequests: "deny", externalWrites: "allow" });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+  const denied = await handler(
+    { toolName: "lsp", input: { action: "request", query: "textDocument/hover", file: "src/file.ts" } },
+    context(workspace, { hasUI: true, approve: true, prompts }),
+  );
+  const localRename = await handler(
+    { toolName: "lsp", input: { action: "rename", file: "src/file.ts", new_name: "renamed" } },
+    context(workspace),
+  );
+
+  assert.equal(denied.block, true);
+  assert.deepEqual(prompts, []);
+  assert.equal(localRename, undefined);
+});
+
+test("fails closed for invalid LSP request policy without blocking known queries", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), { lspRequests: "sometimes" });
+  const handler = registerHandler(agentDir);
+  const request = await handler(
+    { toolName: "lsp", input: { action: "request", query: "textDocument/hover", file: "src/file.ts" } },
+    context(workspace),
+  );
+  const read = await handler(
+    { toolName: "lsp", input: { action: "references", file: "src/file.ts" } },
+    context(workspace),
+  );
+
+  assert.equal(request.block, true);
+  assert.match(request.reason, /lspRequests must be allow, deny, or prompt/);
+  assert.equal(read, undefined);
+});
+
 test("allows common Bash reads, project runners, and workspace writes", async (t) => {
   const { workspace } = await fixture(t);
   const handler = registerHandler();

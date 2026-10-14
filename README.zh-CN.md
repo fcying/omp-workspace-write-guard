@@ -24,6 +24,7 @@
 - `temporary.allowAll` 默认 `true`, 因此 `temporary.root` 严格后代中既有和新建路径的直接写入会绕过 `externalWrites`; 临时根目录自身仍受保护。显式 `protectedPaths` 和 `protectedFiles` 规则仍优先。
 - Bash 自动审批开启时, 插件仍检查命令行中可识别的显式写入目标。
 - `git push` 使用独立策略, 默认直接拒绝。
+- 任意 LSP `request` 使用独立的 `lspRequests` 策略, 默认放行. 其他受支持文件操作仍按目标路径检查.
 
 ## 自定义配置
 
@@ -44,6 +45,7 @@ mkdir -p ~/.omp/agent
 cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
 {
   "externalWrites": "prompt",
+  "lspRequests": "allow",
   "allowPaths": [],
   "protectedPaths": {
     "paths": ["~/.ssh", "~/.gnupg"],
@@ -95,6 +97,7 @@ JSON
 ```json
 {
   "externalWrites": "prompt",
+  "lspRequests": "allow",
   "allowPaths": [],
   "protectedPaths": {
     "paths": [],
@@ -119,6 +122,7 @@ JSON
 字段含义:
 
 - `externalWrites`: `"prompt"`, `"deny"`, `"allow"`。控制未被其他规则匹配的外部写入。
+- `lspRequests`: `"prompt"`, `"deny"`, `"allow"`. 只控制通用 LSP `request`, 与 `externalWrites` 独立. 默认 `"allow"`, 跳过 guard 的这项确认, 无交互 UI 时也允许. `"prompt"` 每次调用确认, 无交互 UI 时拒绝; `"deny"` 不提示直接拒绝. 已知的重命名和 code action 仍按目标路径检查.
 - `allowPaths`: 自动允许写入的目录或文件路径。只允许该路径及其后代。
 - `protectedPaths.paths`: 保护显式访问的文件或目录路径。读取匹配该路径及其后代; 写入还匹配可能包含受保护路径的父目录删除或移动操作。优先级高于工作区、`allowPaths` 和会话授权。设置为 `[]` 可关闭路径保护。
 - `protectedPaths.policy`: `"prompt"` 或 `"deny"`。`"prompt"` 会为每次匹配的工具调用确认, 无交互 UI 时安全拒绝, 且不会记住批准; `"deny"` 直接拒绝且不打开确认框。
@@ -131,6 +135,8 @@ JSON
 - `sessionDirectory.allow`: 是否允许写入当前工作区对应的标准 OMP 会话目录。默认 `true`; 设置为 `false` 后改按 `externalWrites` 处理。显式保护规则仍优先。
 
 - `gitPush`: `"deny"`, `"prompt"`, `"allow"`。即使设为 `"allow"`, `git -C` 或 `--git-dir` 指向外部仓库时仍会执行外部路径检查。
+
+若想在当前工作区要求确认通用 LSP 请求, 在 `.omp/workspace-write-guard.json` 中加入 `"lspRequests": "prompt"` 并重启 OMP. 使用用户配置可全局覆盖.
 
 例如, 拒绝显式访问密钥及 XDG 配置路径, 交互确认 `.env` 和 `.env.local`, 自动允许一个共享构建目录, 禁用临时目录自动认领, 并让 `git push` 每次确认:
 
@@ -264,7 +270,7 @@ Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `mktemp`, `touc
 
 普通文件、归档条目、SQLite 行写入和 `file://` URL 按其底层文件路径判断。`conflict://` 写入按当前会话登记的底层冲突文件路径判断。`local://`, `xd://`, `agent://` 和 `proc://` 不做文件路径检查。已知只读资源 (`artifact://`, `attachment://`, `history://`, `issue://`, `memory://`, `omp://`, `pr://`, `rule://`, `security://`, `skill://`) 不触发外部写入提示; OMP 会拒绝对它们的写入。`cfg://`, `mcp://`, `ssh://`, `vault://` 和未知前缀仍按不透明目标保守处理。
 
-任意 LSP `request` 仍单独确认, 因为协议请求可能触发服务端工作区编辑, 而执行前无法获得完整目标列表。
+任意 LSP `request` 按 `lspRequests` 处理, 默认放行. 设置为 `"prompt"` 时, 确认显示请求方法, 不再声称已发现外部文件目标, 批准不会被记住. 与旧版本不同, `externalWrites` 不再控制 LSP 请求; 如需确认或拒绝, 显式设置 `lspRequests`.
 
 ## 安全边界
 
@@ -273,6 +279,8 @@ Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `mktemp`, `touc
 自动批准 Bash 会信任 `just`, `make`, `npm`, `cargo`, Python 和项目二进制等 runner 或脚本。最终路径没有出现在工具参数中时, 它们可以读取受保护路径或文件, 或写入工作区外。启用 `temporary.allowAll` 时, 指向 `temporary.root` 严格后代的显式写入也会有意绕过 `externalWrites`; 临时根目录自身不在此范围内。命令替换、动态 shell 展开、被 source 的脚本、alias、函数、未知命令、目录搜索和 glob 搜索也有同样限制。临时根目录快照只能识别结果中报告的新命名空间, 不能审计代码的其他副作用。
 
 通过 `proc://` 向进程发送输入可能执行命令并修改工作区外的文件。guard 不检查进程输入的文件系统副作用。
+
+放行通用 LSP 请求意味着信任语言服务器和请求内容. 这类请求可能触发命令或服务端发起的工作区外编辑, 包括受保护文件, 而执行前无法获得完整目标列表. 该选项不放宽其他受支持工具调用的路径检查.
 
 需要强制文件系统边界时, 使用 Bubblewrap、容器或虚拟机。
 

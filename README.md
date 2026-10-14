@@ -24,6 +24,7 @@ Adds low-prompt workspace write protection to Oh My Pi, similar to OpenCode's `e
 - `temporary.allowAll` defaults to `true`, so direct writes to pre-existing and new strict descendants of `temporary.root` bypass `externalWrites`; the temporary root itself remains guarded. Explicit `protectedPaths` and `protectedFiles` rules still take precedence.
 - When Bash is configured for automatic approval, the plugin still checks explicit write targets that can be identified on the command line.
 - `git push` has an independent policy and is denied by default.
+- Arbitrary LSP `request` calls have an independent `lspRequests` policy and are allowed by default. Other supported file operations retain their path checks.
 
 ## Configuration
 
@@ -44,6 +45,7 @@ mkdir -p ~/.omp/agent
 cat > ~/.omp/agent/workspace-write-guard.json <<'JSON'
 {
   "externalWrites": "prompt",
+  "lspRequests": "allow",
   "allowPaths": [],
   "protectedPaths": {
     "paths": ["~/.ssh", "~/.gnupg"],
@@ -95,6 +97,7 @@ Default configuration:
 ```json
 {
   "externalWrites": "prompt",
+  "lspRequests": "allow",
   "allowPaths": [],
   "protectedPaths": {
     "paths": [],
@@ -119,6 +122,7 @@ Default configuration:
 Fields:
 
 - `externalWrites`: `"prompt"`, `"deny"`, or `"allow"`. Controls external writes that do not match another rule.
+- `lspRequests`: `"prompt"`, `"deny"`, or `"allow"`. Controls only raw LSP `request` calls, independently of `externalWrites`. Defaults to `"allow"`, skipping this guard's confirmation even without an interactive UI. `"prompt"` confirms every call and denies without an interactive UI; `"deny"` blocks without prompting. Known rename and code-action operations retain their path checks.
 - `allowPaths`: File or directory paths that can be written without confirmation. Each entry permits only that path and its descendants.
 - `protectedPaths.paths`: File or directory paths whose explicit access is protected. Reads match the path and its descendants. Writes also match parent deletion or move operations that could contain a protected path. This takes precedence over the workspace, `allowPaths`, and session approvals. Set this to `[]` to disable path protection.
 - `protectedPaths.policy`: `"prompt"` or `"deny"`. `"prompt"` confirms every matching tool call and fails closed without an interactive UI; approval is not remembered. `"deny"` blocks immediately without opening a confirmation dialog.
@@ -131,6 +135,8 @@ Fields:
 - `sessionDirectory.allow`: Allows writes to the standard OMP session directory for the current workspace. Defaults to `true`; set it to `false` to apply `externalWrites` instead. Explicit protected rules still take precedence.
 
 - `gitPush`: `"deny"`, `"prompt"`, or `"allow"`. Even when set to `"allow"`, external repository paths supplied through `git -C` or `--git-dir` still undergo external path checks.
+
+To require confirmation for raw LSP requests in the current workspace, add `"lspRequests": "prompt"` to `.omp/workspace-write-guard.json` and restart OMP. Use the user configuration for a global override.
 
 Example: deny explicit access to key and XDG configuration paths, protect `.env` and `.env.local` with an interactive prompt, allow a shared build directory, disable automatic temporary ownership, and prompt for every `git push`:
 
@@ -264,7 +270,7 @@ Bash checks cover shell output redirection, `rm`, `rmdir`, `mkdir`, `mktemp`, `t
 
 Regular files, archive entries, SQLite row writes, and `file://` URLs are evaluated using their underlying file paths. `conflict://` writes are evaluated using the underlying conflict files registered by the current session. `local://`, `xd://`, `agent://`, and `proc://` bypass filesystem-path checks. Known read-only resources (`artifact://`, `attachment://`, `history://`, `issue://`, `memory://`, `omp://`, `pr://`, `rule://`, `security://`, and `skill://`) do not trigger external-write prompts; OMP rejects writes to them. `cfg://`, `mcp://`, `ssh://`, `vault://`, and unknown schemes remain guarded as opaque targets rather than assumed safe.
 
-Arbitrary LSP `request` calls remain separately confirmed because a protocol request can trigger server-initiated workspace edits whose complete targets are unavailable before execution.
+Arbitrary LSP `request` calls follow `lspRequests` and are allowed by default. When set to `"prompt"`, the confirmation shows the request method, rather than claiming that an external file target has been detected. Approval is not remembered. Unlike earlier versions, `externalWrites` no longer controls LSP requests; use `lspRequests` explicitly to require confirmation or denial.
 
 ## Security boundary
 
@@ -273,6 +279,8 @@ This plugin guards against accidental writes. It is not an operating-system sand
 Auto-approved Bash trusts project runners and scripts such as `just`, `make`, `npm`, `cargo`, Python, and project binaries. They can read protected paths or files, or write outside the workspace, when the final path is not visible in the tool arguments. When `temporary.allowAll` is enabled, explicit writes to strict descendants of `temporary.root` also intentionally bypass `externalWrites`; the root itself does not. Command substitution, dynamic shell expansion, sourced scripts, aliases, functions, unknown commands, directory searches, and glob searches have the same limitation. Temporary-root snapshots only identify reported new namespaces; they do not audit other code side effects.
 
 Sending input to a process through `proc://` can execute commands and modify files outside the workspace. The guard does not inspect process input for filesystem side effects.
+
+Allowing raw LSP requests trusts the language server and request content. Such requests can trigger commands or server-initiated edits outside the workspace, including protected files, whose complete targets are unavailable before execution. This option does not relax path checks for other supported tool calls.
 
 Use Bubblewrap, a container, or a virtual machine when an enforceable filesystem boundary is required.
 

@@ -1,5 +1,6 @@
 {
   "externalWrites": "prompt",
+  "lspRequests": "allow",
   "allowPaths": [],
   "protectedPaths": {
     "paths": [],

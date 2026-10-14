@@ -36,7 +36,7 @@ This plugin is an accidental-write guard, not an operating-system sandbox. Never
 - Approving a directory allows only that directory and its descendants. Never broaden approval to its parent or sibling directories.
 - Fail closed for explicit write targets that cannot be resolved reliably: request confirmation when a UI exists and deny without a UI.
 - Treat `local://` and `xd://` as OMP internal resources rather than ordinary external filesystem paths.
-- Continue to confirm arbitrary LSP `request` calls. Known rename and code-action operations wholly inside the workspace should not create extra prompts.
+- Raw LSP `request` calls follow the independent `lspRequests` policy, which defaults to `allow`. `prompt` confirms every call and fails closed without a UI; `deny` blocks without prompting. Known rename and code-action operations wholly inside the workspace should not create extra prompts.
 - Bash parsing protects only explicit write targets visible in the command line. Any coverage change must preserve an accurate security-boundary section in `README.md`.
 - Protected-path and protected-file checks cover only explicit paths supplied to supported tools. Keep the README security boundary accurate for directory searches, glob searches, Bash, Eval, scripts, and other implicit access.
 - Detect direct, wrapped, `git -C`, Git-global-option, and compound-command forms of `git push`; apply the configured policy without bypassing external repository checks.
