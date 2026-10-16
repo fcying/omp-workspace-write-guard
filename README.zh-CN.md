@@ -266,6 +266,14 @@ omp plugin install omp-workspace-write-guard@fcying-omp-plugins
 
 Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `mktemp`, `touch`, `truncate`, `cp`, `mv`, `install`, `ln`, `chmod`, `chown`, `chgrp`, `tee`, `dd of=`, 原地修改的 `sed` / `perl`, 以及会修改仓库的 Git 命令。比较前会解析结构化 Bash `cwd`, `cd`, Git `-C`, glob, home 路径和符号链接。只有工具结果确认目录已经创建后, 插件才会授予新临时命名空间当前进程的所有权。对于 `mktemp`, 插件仅认领成功结果中报告了完整路径、与显式尾部 `X` 模板匹配的新增一级命名空间。对于 `eval`, 插件仅认领成功结果中报告了完整路径的新增一级命名空间。
 
+`git add` 和 `git commit` 检查实际 Git 目录、共享 worktree 元数据、index 及其 `.lock` 路径和 objects 目录, 不再把整个工作目录当作写入目标. index 涉及软链接时, 同时检查原始路径与解析后路径旁的锁文件. 因此, 受保护的工作树文件不会阻止无关的暂存或提交, 但受保护或位于工作区外的 Git 元数据仍受检查.
+
+guard 使用 `git rev-parse` 查询这些路径, 保留仓库选择选项及命令中可静态识别的 `GIT_*` 环境覆盖, 并在应用常规策略前解析软链接. 探测进程关闭 Git trace 输出, 包括继承的设置, 避免权限检查在审批前写入追踪文件. 该隔离不改变原始命令的设置. 通过支持的 `GIT_TRACE*` 环境变量显式指定的绝对文件路径, 包括继承值, 会单独按常规文件策略检查. 仅写文件描述符的 trace 不增加文件目标; 不支持的 trace 目标按无法解析处理. 不枚举隐藏在 Git 配置中的 trace 目标. 这两个命令的显式 `--work-tree` 路径按读取检查.
+
+元数据探测不重放 `env -u` / `--unset`, `env -i` / `--ignore-environment`, `sudo` 等改变环境的包装器, 而是将对应 Git 操作按无法解析处理. 观察到 `GIT_*` 的 export, unset, 独立赋值, 追加赋值 (`+=`), shell 变量写入或 `source` / `eval` 后, 同一次 Bash 调用余下的 Git 元数据操作也按无法解析处理. 未解析的 shell 复合结构同样使后续元数据探测失效. Git 路径含有被引用或转义的波浪号时按无法解析处理, 不展开成另一个路径. 这一保守状态不会延续到后续工具调用. 简单的字面量命令级赋值和普通 `env` 前缀仍受支持.
+
+无论是元数据查询失败还是静态解析失败, 都保留已配置的 `protectedPaths` 检查: `deny` 直接拒绝, `prompt` 每次确认且无 UI 时拒绝, 即使 `externalWrites` 为 `allow` 也不例外. 否则, 无法解析的目标按 `externalWrites` 处理, 默认确认. 不缓存无法解析目标的目录授权. 其他会修改仓库的 Git 命令仍保守检查工作目录.
+
 `git push` 检测覆盖直接调用、wrapper、`git -C`、Git 全局选项和复合命令。`gitPush: "deny"` 时立即拒绝且不打开确认框; `"prompt"` 时独立确认; `"allow"` 时仍保留仓库路径检查。
 
 普通文件、归档条目、SQLite 行写入和 `file://` URL 按其底层文件路径判断。`conflict://` 写入按当前会话登记的底层冲突文件路径判断。`local://`, `xd://`, `agent://` 和 `proc://` 不做文件路径检查。已知只读资源 (`artifact://`, `attachment://`, `history://`, `issue://`, `memory://`, `omp://`, `pr://`, `rule://`, `security://`, `skill://`) 不触发外部写入提示; OMP 会拒绝对它们的写入。`cfg://`, `mcp://`, `ssh://`, `vault://` 和未知前缀仍按不透明目标保守处理。
@@ -277,6 +285,8 @@ Bash 检查覆盖 shell 输出重定向, `rm`, `rmdir`, `mkdir`, `mktemp`, `touc
 本插件用于防止误写, 不是操作系统沙箱。shell 解析器无法证明任意命令的实际副作用。
 
 自动批准 Bash 会信任 `just`, `make`, `npm`, `cargo`, Python 和项目二进制等 runner 或脚本。最终路径没有出现在工具参数中时, 它们可以读取受保护路径或文件, 或写入工作区外。启用 `temporary.allowAll` 时, 指向 `temporary.root` 严格后代的显式写入也会有意绕过 `externalWrites`; 临时根目录自身不在此范围内。命令替换、动态 shell 展开、被 source 的脚本、alias、函数、未知命令、目录搜索和 glob 搜索也有同样限制。临时根目录快照只能识别结果中报告的新命名空间, 不能审计代码的其他副作用。
+
+Git hooks 和 clean filters 可能执行程序并修改受保护文件或工作区外的路径. 元数据查询不执行所请求的 `add` 或 `commit`, 也不执行它们的 hooks 或 filters, 但 guard 无法静态检查实际命令运行时这些程序的副作用.
 
 通过 `proc://` 向进程发送输入可能执行命令并修改工作区外的文件。guard 不检查进程输入的文件系统副作用。
 

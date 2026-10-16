@@ -1,6 +1,7 @@
 import { loadGuardConfig, type GuardConfig } from "./config.ts";
-import { bashWriteTargets } from "./bash-targets.ts";
+import { bashWriteTargets, type BashTarget } from "./bash-targets.ts";
 import { lstat, readdir, readlink, realpath } from "node:fs/promises";
+import { execFile as execFileCallback } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import {
   basename,
@@ -12,13 +13,21 @@ import {
   sep,
 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
+const execFile = promisify(execFileCallback);
 const EDIT_SECTION = /^\[([^\]\r\n]+)#[0-9A-F]{4}\]\s*$/gm;
 const PATCH_FILE = /^\*\*\* (Add|Update|Delete) File:\s*(.+)\s*$/gm;
 const PATCH_MOVE = /^\*\*\* Move to:\s*(.+)\s*$/gm;
 const EDIT_MOVE = /^MV\s+(.+?)\s*$/gm;
 const ARCHIVE_OR_DB = /^(.*\.(?:tar\.gz|tgz|tar|zip|jar|war|ear|apk|sqlite|sqlite3|db|db3)):/i;
+const GIT_TRACE_TARGET_VARIABLES = [
+  "GIT_TRACE", "GIT_TRACE_BARE", "GIT_TRACE_CURL", "GIT_TRACE_FSMONITOR",
+  "GIT_TRACE_PACK_ACCESS", "GIT_TRACE_PACKET", "GIT_TRACE_PACKFILE",
+  "GIT_TRACE_PERFORMANCE", "GIT_TRACE_REFS", "GIT_TRACE_SETUP", "GIT_TRACE_SHALLOW",
+  "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF",
+] as const;
 const UNGUARDED_INTERNAL_URL = /^(?:agent|artifact|attachment|history|issue|local|memory|omp|pr|proc|rule|security|skill|xd):\/\//;
 const MUTATING_LSP_ACTIONS: Record<string, true> = {
   rename: true,
@@ -43,6 +52,8 @@ type Target =
   | { kind: "path"; value: string; base?: string; creates?: true; access?: "read"; temporaryTemplate?: true; temporary?: true; display?: string }
   | { kind: "opaque"; value: string }
   | { kind: "git-push" };
+
+type ParsedTarget = Target | Extract<BashTarget, { kind: "git-metadata" }>;
 
 interface ResolvedGuardConfig {
   values: GuardConfig;
@@ -163,7 +174,7 @@ function readTarget(raw: string): Target | undefined {
   return target?.kind === "path" ? { ...target, access: "read" } : undefined;
 }
 
-function targetsFor(toolName: string, input: ToolInput, cwd: string, conflictPaths: ReadonlyMap<number, string>): Target[] {
+function targetsFor(toolName: string, input: ToolInput, cwd: string, conflictPaths: ReadonlyMap<number, string>): ParsedTarget[] {
   if (toolName === "write") {
     return strings(input.path).flatMap((value) => {
       const conflicts = conflictTargets(value, input.content, conflictPaths);
@@ -284,6 +295,51 @@ async function canonicalPath(path: string, cwd: string, depth = 0): Promise<stri
   }
 }
 
+async function gitMetadataTargets(target: Extract<BashTarget, { kind: "git-metadata" }>): Promise<Target[]> {
+  if (!target.base || target.unresolved) throw new Error("Cannot resolve dynamic Git metadata");
+  const environment = { ...process.env, ...target.environment };
+  const tracePaths: string[] = [];
+  for (const name of GIT_TRACE_TARGET_VARIABLES) {
+    const value = environment[name];
+    // Git accepts single-digit descriptors and booleans, not relative file paths.
+    if (!value || /^(?:[0-9]|true|false)$/i.test(value)) continue;
+    // Socket destinations and other unsupported values must not become guessed paths.
+    if (!isAbsolute(value) || cleanPath(value) !== value) {
+      throw new Error(`Cannot resolve Git trace target: ${name}`);
+    }
+    tracePaths.push(value);
+  }
+  // Collect original destinations before preventing the metadata probe from tracing.
+  for (const name in environment) {
+    if (name.startsWith("GIT_TRACE")) environment[name] = "0";
+  }
+  // Explicit targets also override trace2 destinations from Git configuration.
+  environment.GIT_TRACE = "0";
+  environment.GIT_TRACE2 = "0";
+  environment.GIT_TRACE2_EVENT = "0";
+  environment.GIT_TRACE2_PERF = "0";
+  const { stdout } = await execFile("git", [
+    ...target.args,
+    "--no-pager", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir",
+    "--git-path", "index", "--git-path", "objects",
+  ], {
+    cwd: target.base,
+    env: environment,
+    timeout: 5_000,
+    maxBuffer: 1024 * 1024,
+  });
+  const paths = stdout.split("\n");
+  if (paths.pop() !== "" || paths.length !== 4 || paths.some((path) => !isAbsolute(path))) {
+    throw new Error("Cannot resolve Git metadata paths reliably");
+  }
+  const indexPath = paths[2];
+  const resolvedIndex = await canonicalPath(indexPath, target.base);
+  paths.push(`${indexPath}.lock`);
+  if (resolvedIndex !== indexPath) paths.push(`${resolvedIndex}.lock`);
+  paths.push(...tracePaths);
+  return unique(paths).map((value) => ({ kind: "path", value, base: target.base }));
+}
+
 function isWithin(root: string, target: string): boolean {
   const rel = relative(root, target);
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
@@ -402,12 +458,12 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
       return { block: true, reason: `Invalid input for ${event.toolName}` };
     }
 
-    const targets = targetsFor(event.toolName, input, ctx.cwd, conflictPaths);
+    const requestedTargets = targetsFor(event.toolName, input, ctx.cwd, conflictPaths);
     const lspRequest = event.toolName === "lsp" && input.action === "request";
-    const observesTemporary = event.toolName === "eval" || targets.some((target) =>
+    const observesTemporary = event.toolName === "eval" || requestedTargets.some((target) =>
       target.kind === "path" && target.temporaryTemplate === true
     );
-    if (targets.length === 0 && !observesTemporary && !lspRequest) return;
+    if (requestedTargets.length === 0 && !observesTemporary && !lspRequest) return;
 
     let root: string;
     let config: ResolvedGuardConfig;
@@ -449,10 +505,34 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     }
 
 
-    const gitPush = targets.some((target) => target.kind === "git-push");
+    const gitPush = requestedTargets.some((target) => target.kind === "git-push");
     if (gitPush && config.values.gitPush === "deny") {
       return { block: true, reason: "git push is blocked by workspace write guard configuration" };
     }
+
+    const protectedTargets: Array<{ display: string; access: "read" | "write" }> = [];
+    for (let index = 0; index < requestedTargets.length; index += 1) {
+      const target = requestedTargets[index];
+      if (target.kind !== "git-metadata") continue;
+      let expanded: Target[];
+      try {
+        expanded = await gitMetadataTargets(target);
+      } catch {
+        const directory = target.base ?? "(unknown directory)";
+        const display = `Unresolved Git metadata in ${directory}`;
+        if (config.protectedPaths.length > 0) {
+          if (config.values.protectedPaths.policy === "deny") {
+            return { block: true, reason: `Cannot verify Git metadata against workspace write guard protectedPaths: ${directory}` };
+          }
+          protectedTargets.push({ display, access: "write" });
+        }
+        expanded = [{ kind: "opaque", value: display }];
+      }
+      requestedTargets.splice(index, 1, ...expanded);
+      index += expanded.length - 1;
+    }
+    // All Git metadata descriptors have been expanded into permission targets.
+    const targets = requestedTargets as Target[];
 
     const approvedDirectories = approvedDirectorySet(root);
     const ownedTemporaryPaths = ownedTemporaryPathSet(root);
@@ -475,7 +555,6 @@ export default function workspaceWriteGuard(pi: ExtensionAPI): void {
     const temporaryCandidates = new Set<string>();
     const temporaryTemplates: Array<{ template: string; base: string }> = [];
     const external: Array<{ display: string; directory?: string }> = [];
-    const protectedTargets: Array<{ display: string; access: "read" | "write" }> = [];
     const commandRequests = gitPush && config.values.gitPush === "prompt" ? ["git push"] : [];
 
     for (const target of targets) {

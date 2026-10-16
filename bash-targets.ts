@@ -6,16 +6,18 @@ export type BashTarget =
     kind: "path";
     value: string;
     base: string;
+    access?: "read";
     creates?: true;
     temporaryTemplate?: true;
     temporary?: true;
     display?: string;
   }
   | { kind: "opaque"; value: string }
+  | { kind: "git-metadata"; base?: string; args: string[]; environment?: Record<string, string>; unresolved?: true }
   | { kind: "git-push" };
 
 type Token =
-  | { kind: "word"; value: string }
+  | { kind: "word"; value: string; literalTilde?: true }
   | { kind: "operator"; value: string };
 
 const CONTROL_OPERATORS: Record<string, true> = {
@@ -83,6 +85,14 @@ const COMMAND_WRAPPERS: Record<string, true> = {
   nohup: true,
   sudo: true,
   time: true,
+};
+const ENV_OPTIONS_WITH_VALUE: Record<string, true> = {
+  "-u": true,
+  "--unset": true,
+  "-C": true,
+  "--chdir": true,
+  "-a": true,
+  "--argv0": true,
 };
 const GIT_MUTATORS: Record<string, true> = {
   add: true,
@@ -167,12 +177,20 @@ const MKTEMP_OPTIONS_WITH_VALUE: Record<string, true> = {
 function tokenize(command: string): Token[] {
   const tokens: Token[] = [];
   let word = "";
+  let literalTilde = false;
 
   let quote: "'" | '"' | undefined;
 
   const flush = (): void => {
-    if (word !== "") tokens.push({ kind: "word", value: word });
+    if (word !== "") {
+      if (literalTilde) {
+        tokens.push({ kind: "word", value: word, literalTilde: true });
+      } else {
+        tokens.push({ kind: "word", value: word });
+      }
+    }
     word = "";
+    literalTilde = false;
   };
 
   for (let index = 0; index < command.length; index += 1) {
@@ -183,8 +201,10 @@ function tokenize(command: string): Token[] {
         quote = undefined;
       } else if (char === "\\" && quote === '"' && index + 1 < command.length) {
         index += 1;
+        if (command[index] === "~") literalTilde = true;
         word += command[index];
       } else {
+        if (char === "~") literalTilde = true;
         word += char;
       }
       continue;
@@ -196,6 +216,7 @@ function tokenize(command: string): Token[] {
     }
     if (char === "\\" && index + 1 < command.length) {
       index += 1;
+      if (command[index] === "~") literalTilde = true;
       word += command[index];
       continue;
     }
@@ -320,41 +341,64 @@ function destinationOperand(words: string[]): string | undefined {
 
 function unwrapCommand(words: string[]): string[] {
   let index = 0;
-  while (index < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index])) index += 1;
+  while (index < words.length && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(words[index])) index += 1;
 
   while (index < words.length) {
     const command = basename(words[index]);
-    if (!Object.hasOwn(COMMAND_WRAPPERS, command)) break;
-    index += 1;
-    while (index < words.length && words[index].startsWith("-")) index += 1;
-  }
-
-  if (basename(words[index] ?? "") === "env") {
-    index += 1;
-    while (
-      index < words.length &&
-      (words[index].startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]))
-    ) {
+    if (Object.hasOwn(COMMAND_WRAPPERS, command)) {
       index += 1;
+      while (index < words.length && words[index].startsWith("-")) index += 1;
+      continue;
+    }
+    if (command !== "env") break;
+    index += 1;
+    let options = true;
+    while (index < words.length) {
+      const word = words[index];
+      if (options && word === "--") {
+        options = false;
+        index += 1;
+        continue;
+      }
+      if (options && Object.hasOwn(ENV_OPTIONS_WITH_VALUE, word)) {
+        index += 2;
+        continue;
+      }
+      if ((options && word.startsWith("-")) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
+        index += 1;
+        continue;
+      }
+      break;
     }
   }
 
   return words.slice(index);
 }
 
-function gitTargets(args: string[], base: string | undefined): BashTarget[] {
+function gitTargets(args: string[], base: string | undefined, environment?: Record<string, string>, literalTildeWords?: ReadonlySet<string>): BashTarget[] {
   let gitBase = base;
   const scopeTargets: BashTarget[] = [];
+  const workTreeReads: BashTarget[] = [];
+  const metadataArgs: string[] = [];
   let index = 0;
+  let literalMetadataTilde = false;
+  const expandMetadataHome = (value: string, originalWord = value): string => {
+    if (literalTildeWords?.has(originalWord)) {
+      literalMetadataTilde = true;
+      return value;
+    }
+    return expandHome(value);
+  };
 
   while (index < args.length) {
     const word = args[index];
     if (word === "-C") {
       const directory = args[index + 1];
+      const expanded = expandMetadataHome(directory ?? "");
+      metadataArgs.push(word, expanded);
       if (!directory || !gitBase || hasDynamicExpansion(directory)) {
         gitBase = undefined;
       } else {
-        const expanded = expandHome(directory);
         gitBase = isAbsolute(expanded) ? resolve(expanded) : resolve(gitBase, expanded);
       }
       index += 2;
@@ -362,10 +406,11 @@ function gitTargets(args: string[], base: string | undefined): BashTarget[] {
     }
     if (word.startsWith("-C") && word.length > 2) {
       const directory = word.slice(2);
+      const expanded = expandMetadataHome(directory, word);
+      metadataArgs.push("-C", expanded);
       if (!gitBase || hasDynamicExpansion(directory)) {
         gitBase = undefined;
       } else {
-        const expanded = expandHome(directory);
         gitBase = isAbsolute(expanded) ? resolve(expanded) : resolve(gitBase, expanded);
       }
       index += 1;
@@ -377,17 +422,35 @@ function gitTargets(args: string[], base: string | undefined): BashTarget[] {
       const optionValue = optionName === word
         ? args[index + 1]
         : word.slice(optionName.length + 1);
+      if (optionName === "--git-dir" || optionName === "--work-tree") {
+        let originalWord = word;
+        if (optionName === word && optionValue !== undefined) originalWord = optionValue;
+        metadataArgs.push(optionName, expandMetadataHome(optionValue ?? "", originalWord));
+      } else if (optionName !== "--exec-path") {
+        metadataArgs.push(word);
+        if (optionName === word) metadataArgs.push(optionValue ?? "");
+      }
       if ((optionName === "--git-dir" || optionName === "--work-tree") && optionValue) {
         scopeTargets.push(pathTarget(optionValue, gitBase, `git ${optionName}`));
+        if (optionName === "--work-tree") {
+          const target = pathTarget(optionValue, gitBase, "git work-tree read");
+          if (target.kind === "path") {
+            workTreeReads.push({ ...target, access: "read" });
+          } else {
+            workTreeReads.push(target);
+          }
+        }
       }
       index += optionName === word ? 2 : 1;
       continue;
     }
     if (word.length > 2 && Object.hasOwn(GIT_OPTIONS_WITH_VALUE, word.slice(0, 2))) {
+      metadataArgs.push(word);
       index += 1;
       continue;
     }
     if (word.startsWith("-")) {
+      if (word === "--bare") metadataArgs.push(word);
       index += 1;
       continue;
     }
@@ -400,6 +463,20 @@ function gitTargets(args: string[], base: string | undefined): BashTarget[] {
   }
   if (!subcommand || !Object.hasOwn(GIT_MUTATORS, subcommand)) return [];
   const subcommandArgs = args.slice(index + 1);
+
+  if (subcommand === "add" || subcommand === "commit") {
+    let dynamicEnvironment = false;
+    if (environment) {
+      for (const key in environment) {
+        if (hasDynamicExpansion(environment[key])) dynamicEnvironment = true;
+      }
+    }
+    const target: Extract<BashTarget, { kind: "git-metadata" }> = {
+      kind: "git-metadata", base, args: metadataArgs, environment,
+    };
+    if (!base || metadataArgs.some(hasDynamicExpansion) || dynamicEnvironment || literalMetadataTilde) target.unresolved = true;
+    return [...workTreeReads, target];
+  }
 
   if (subcommand === "clone") {
     const values = positionalArguments(subcommandArgs, GIT_CLONE_OPTIONS_WITH_VALUE);
@@ -465,7 +542,7 @@ function gitTargets(args: string[], base: string | undefined): BashTarget[] {
   return [...scopeTargets, pathTarget(".", gitBase, `git ${subcommand} working directory`)];
 }
 
-function commandTargets(words: string[], base: string | undefined, temporaryVariables: ReadonlySet<string>): BashTarget[] {
+function commandTargets(words: string[], base: string | undefined, temporaryVariables: ReadonlySet<string>, gitEnvironmentUnresolved: boolean, literalTildeWords?: ReadonlySet<string>): BashTarget[] {
   const commandWords = unwrapCommand(words);
   if (commandWords.length === 0) return [];
 
@@ -517,7 +594,43 @@ function commandTargets(words: string[], base: string | undefined, temporaryVari
     const files = argsWithoutOptions.slice(1);
     return files.map((value) => pathTarget(value, base, `${command} in-place`));
   }
-  if (command === "git") return gitTargets(args, base);
+  if (command === "git") {
+    let environment: Record<string, string> | undefined;
+    let environmentWrapper = false;
+    let unresolved = gitEnvironmentUnresolved;
+    const prefixLength = words.length - commandWords.length;
+    for (let index = 0; index < prefixLength; index += 1) {
+      const word = words[index];
+      if (!/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(word)) {
+        const wrapper = basename(word);
+        if (wrapper === "sudo") unresolved = true;
+        if (wrapper === "env") environmentWrapper = true;
+        if (environmentWrapper && word.startsWith("-") && word !== "--") unresolved = true;
+      }
+      const assignment = words[index].match(/^(GIT_[A-Z0-9_]+)(\+?)=(.*)$/);
+      if (!assignment) continue;
+      if (assignment[2] === "+") {
+        unresolved = true;
+        continue;
+      }
+      environment ??= {};
+      const name = assignment[1];
+      let value = assignment[3];
+      if (literalTildeWords?.has(word)) {
+        unresolved = true;
+      } else if (/^GIT_(?:DIR|WORK_TREE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY)$/.test(name)) {
+        value = expandHome(value);
+      }
+      environment[name] = value;
+    }
+    const targets = gitTargets(args, base, environment, literalTildeWords);
+    if (unresolved) {
+      for (const target of targets) {
+        if (target.kind === "git-metadata") target.unresolved = true;
+      }
+    }
+    return targets;
+  }
 
   return [];
 }
@@ -529,9 +642,11 @@ function processSegment(
   implicitTemporaryRoot: string | undefined,
   persistsTemporaryVariables: boolean,
   canCreateTemporary: boolean,
-): { targets: BashTarget[]; nextBase?: string } {
+  gitEnvironmentUnresolved: boolean,
+): { targets: BashTarget[]; nextBase?: string; gitEnvironmentUnresolved: boolean } {
   const words: string[] = [];
   const targets: BashTarget[] = [];
+  let literalTildeWords: Set<string> | undefined;
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
@@ -551,14 +666,16 @@ function processSegment(
       continue;
     }
     words.push(token.value);
+    if (token.literalTilde) (literalTildeWords ??= new Set()).add(token.value);
   }
 
-  const assignmentName = words[0]?.match(/^([A-Za-z_][A-Za-z0-9_]*)=/)?.[1];
+  const assignmentName = words[0]?.match(/^([A-Za-z_][A-Za-z0-9_]*)\+?=/)?.[1];
   const assignmentOnlyMktemp = implicitTemporaryRoot !== undefined && assignmentName !== undefined && (
     (words.length === 1 && words[0] === `${assignmentName}=$(mktemp -d)`) ||
     (words.length === 2 && words[0] === `${assignmentName}=$(mktemp` && words[1] === "-d)")
   );
   if (assignmentOnlyMktemp && persistsTemporaryVariables && canCreateTemporary) {
+    if (assignmentName.startsWith("GIT_")) gitEnvironmentUnresolved = true;
     const target = pathTarget(implicitTemporaryRoot, base, "mktemp output directory", true);
     if (target.kind === "path") {
       temporaryVariables.add(assignmentName);
@@ -566,15 +683,24 @@ function processSegment(
     } else {
       targets.push(target);
     }
-  } else if (words.length > 0 && words.every((word) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(word))) {
-    for (const word of words) temporaryVariables.delete(word.slice(0, word.indexOf("=")));
+  } else if (words.length > 0 && words.every((word) => /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(word))) {
+    for (const word of words) {
+      const name = word.match(/^([A-Za-z_][A-Za-z0-9_]*)\+?=/)![1];
+      temporaryVariables.delete(name);
+      if (name.startsWith("GIT_")) gitEnvironmentUnresolved = true;
+    }
   }
 
   const commandWords = unwrapCommand(words);
+  // Compound shell syntax can hide current-shell environment changes from this flat parser.
+  if (/^(?:[{}()]|if|then|else|elif|fi|for|while|until|do|done|case|esac|select|function)$/.test(commandWords[0] ?? "") || /^[({]/.test(commandWords[0] ?? "")) {
+    gitEnvironmentUnresolved = true;
+  }
   if (["export", "readonly", "declare", "typeset"].includes(basename(commandWords[0] ?? ""))) {
     for (const word of commandWords.slice(1)) {
-      const name = word.match(/^([A-Za-z_][A-Za-z0-9_]*)=/)?.[1];
+      const name = word.match(/^([A-Za-z_][A-Za-z0-9_]*)\+?=/)?.[1];
       if (name) temporaryVariables.delete(name);
+      if (/^GIT_[A-Z0-9_]+(?:\+?=|$)/.test(word)) gitEnvironmentUnresolved = true;
     }
   }
   const command = basename(commandWords[0] ?? "");
@@ -583,28 +709,32 @@ function processSegment(
       const option = commandWords[index];
       const name = option === "-v" ? commandWords[index + 1] : option.startsWith("-v") ? option.slice(2) : undefined;
       if (name?.match(/^[A-Za-z_][A-Za-z0-9_]*$/)) temporaryVariables.delete(name);
+      if (name?.startsWith("GIT_")) gitEnvironmentUnresolved = true;
       if (option === "-v") index += 1;
     }
   } else if (command === "read" || command === "mapfile" || command === "readarray" || command === "unset") {
     for (const word of operands(commandWords.slice(1))) {
       if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) temporaryVariables.delete(word);
+      if (word.startsWith("GIT_")) gitEnvironmentUnresolved = true;
     }
   } else if (command === "eval" || command === "." || command === "source") {
     temporaryVariables.clear();
+    gitEnvironmentUnresolved = true;
   }
 
   if (basename(commandWords[0] ?? "") === "cd") {
     const destination = operands(commandWords.slice(1))[0] ?? homedir();
-    if (!base || hasDynamicExpansion(destination)) return { targets, nextBase: undefined };
+    if (!base || hasDynamicExpansion(destination)) return { targets, nextBase: undefined, gitEnvironmentUnresolved };
     const expanded = expandHome(destination);
     return {
       targets,
       nextBase: isAbsolute(expanded) ? resolve(expanded) : resolve(base, expanded),
+      gitEnvironmentUnresolved,
     };
   }
 
-  targets.push(...commandTargets(words, base, temporaryVariables));
-  return { targets, nextBase: base };
+  targets.push(...commandTargets(words, base, temporaryVariables, gitEnvironmentUnresolved, literalTildeWords));
+  return { targets, nextBase: base, gitEnvironmentUnresolved };
 }
 
 export function bashWriteTargets(command: string, sessionCwd: string, requestedCwd?: string): BashTarget[] {
@@ -617,6 +747,7 @@ export function bashWriteTargets(command: string, sessionCwd: string, requestedC
   const targets: BashTarget[] = [];
   const temporaryVariables = new Set<string>();
   const implicitTemporaryRoot = /\b(?:TMPDIR|TMP|TEMP)=/.test(command) ? undefined : tmpdir();
+  let gitEnvironmentUnresolved = false;
   let segment: Token[] = [];
 
   let firstSegment = true;
@@ -629,10 +760,12 @@ export function bashWriteTargets(command: string, sessionCwd: string, requestedC
       implicitTemporaryRoot,
       persistsTemporaryVariables,
       firstSegment,
+      gitEnvironmentUnresolved,
     );
     firstSegment = false;
     targets.push(...result.targets);
     base = result.nextBase;
+    gitEnvironmentUnresolved = result.gitEnvironmentUnresolved;
     segment = [];
   };
 

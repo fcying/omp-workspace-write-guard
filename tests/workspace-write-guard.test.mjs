@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import test from "node:test";
@@ -10,6 +10,43 @@ import workspaceWriteGuard from "../index.ts";
 
 const execFile = promisify(execFileCallback);
 const DEFAULT_AGENT_DIR = join(tmpdir(), `omp-write-guard-test-agent-${process.pid}`);
+
+function gitEnvironment(overrides = {}) {
+  const environment = { ...process.env };
+  for (const name in environment) {
+    if (name.startsWith("GIT_")) delete environment[name];
+  }
+  return { ...environment, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", ...overrides };
+}
+
+async function runGit(cwd, ...args) {
+  return execFile("git", [
+    "-c", "user.name=Guard Test", "-c", "user.email=guard@example.invalid",
+    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+    ...args,
+  ], { cwd, env: gitEnvironment() });
+}
+
+async function guardWithEnvironment(workspace, agentDir, command, environment) {
+  const source = `
+    import guard from ${JSON.stringify(new URL("../index.ts", import.meta.url).href)};
+    let handler;
+    guard({
+      pi: { getAgentDir: () => ${JSON.stringify(agentDir)} },
+      setLabel() {},
+      on(event, callback) { if (event === "tool_call") handler = callback; },
+    });
+    const result = await handler(
+      { toolName: "bash", input: { command: ${JSON.stringify(command)} } },
+      { cwd: ${JSON.stringify(workspace)}, hasUI: false },
+    );
+    console.log(JSON.stringify(result ?? null));
+  `;
+  const { stdout } = await execFile(process.execPath, ["--input-type=module", "-e", source], {
+    env: gitEnvironment(environment),
+  });
+  return JSON.parse(stdout);
+}
 
 async function sessionBucket(workspace) {
   workspace = await realpath(workspace);
@@ -621,6 +658,7 @@ test("fails closed for invalid LSP request policy without blocking known queries
 
 test("allows common Bash reads, project runners, and workspace writes", async (t) => {
   const { workspace } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
   const handler = registerHandler();
   const commands = [
     "git rev-parse HEAD",
@@ -639,6 +677,494 @@ test("allows common Bash reads, project runners, and workspace writes", async (t
     assert.equal(result, undefined, command);
   }
 });
+
+test("allows Git staging and commits beside a symlinked protected file", async (t) => {
+  const { root, workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await mkdir(join(workspace, "docker"));
+  await mkdir(join(workspace, "src"));
+  const protectedFile = join(workspace, "docker", "shrc.local");
+  const protectedAlias = join(root, ".shrc.local");
+  await writeFile(protectedFile, "protected\n");
+  await symlink(protectedFile, protectedAlias);
+  await writeConfig(join(workspace, ".omp"), {
+    protectedPaths: { paths: [protectedAlias], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+
+  for (const input of [
+    { command: "git add src/file.ts" },
+    { command: 'git commit -m "update notes"' },
+    { command: "git -C src add file.ts" },
+    { command: 'cd src && git commit -m "update notes"' },
+    { command: "git --git-dir=.git --work-tree=. add ." },
+    { command: 'command git -c user.name=Test commit -m "update notes"' },
+    { command: "git add file.ts", cwd: join(workspace, "src") },
+  ]) {
+    const result = await handler(
+      { toolName: "bash", input },
+      context(workspace, { hasUI: true, prompts }),
+    );
+    assert.equal(result, undefined, input.command);
+  }
+  assert.deepEqual(prompts, []);
+
+  for (const command of ["rm -rf docker", "mv docker relocated", "git reset --hard", "git checkout -- docker/shrc.local"]) {
+    const result = await handler({ toolName: "bash", input: { command } }, context(workspace));
+    assert.equal(result.block, true, command);
+  }
+  const directWrite = await handler(
+    { toolName: "write", input: { path: protectedAlias, content: "blocked" } },
+    context(workspace),
+  );
+  assert.equal(directWrite.block, true);
+});
+
+test("keeps protected Git metadata guarded for add and commit", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await writeConfig(join(workspace, ".omp"), {
+    protectedPaths: { paths: [join(workspace, ".git", "index")], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+  for (const command of ["git add .", 'git commit -m "update"']) {
+    const result = await handler({ toolName: "bash", input: { command } }, context(workspace));
+    assert.equal(result.block, true, command);
+  }
+});
+
+test("guards Git metadata reached through a symlink or explicit Git directory", async (t) => {
+  const { workspace, outside, agentDir } = await fixture(t);
+  await runGit(outside, "init", "--quiet");
+  await symlink(join(outside, ".git"), join(workspace, ".git"));
+  await writeConfig(join(workspace, ".omp"), { externalWrites: "deny" });
+  const handler = registerHandler(agentDir);
+  for (const command of [
+    "git add .",
+    `git --git-dir=${join(outside, ".git")} --work-tree=. commit -m update`,
+    `GIT_DIR=${join(outside, ".git")} git add .`,
+    `env GIT_DIR=${join(outside, ".git")} git commit -m update`,
+  ]) {
+    const result = await handler({ toolName: "bash", input: { command } }, context(workspace));
+    assert.equal(result.block, true, command);
+    assert.match(result.reason, /Write outside workspace denied/);
+  }
+});
+
+test("guards separate Git directories referenced by a gitfile", async (t) => {
+  const { workspace, outside, agentDir } = await fixture(t);
+  const metadata = join(outside, "metadata");
+  await runGit(workspace, "init", "--quiet", `--separate-git-dir=${metadata}`);
+  await writeConfig(join(workspace, ".omp"), { externalWrites: "deny" });
+  const handler = registerHandler(agentDir);
+  const result = await handler(
+    { toolName: "bash", input: { command: "git commit -m update" } },
+    context(workspace),
+  );
+  assert.equal(result.block, true);
+  assert.match(result.reason, /outside\/metadata/);
+});
+
+test("checks shared worktree metadata even when its private Git directory is allowed", async (t) => {
+  const { root, outside, agentDir } = await fixture(t);
+  const workspace = join(root, "linked-workspace");
+  await runGit(outside, "init", "--quiet");
+  await writeFile(join(outside, "tracked.txt"), "initial\n");
+  await runGit(outside, "add", "tracked.txt");
+  await runGit(outside, "commit", "--quiet", "-m", "initial");
+  await runGit(outside, "worktree", "add", "--detach", workspace);
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "deny",
+    allowPaths: [join(outside, ".git", "worktrees")],
+  });
+  const handler = registerHandler(agentDir);
+  const result = await handler(
+    { toolName: "bash", input: { command: "git commit -m update" } },
+    context(workspace),
+  );
+  assert.equal(result.block, true);
+  assert.match(result.reason, /outside\/\.git/);
+});
+
+test("guards command-scoped Git index and object directory overrides", async (t) => {
+  const { workspace, outside, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await mkdir(join(outside, "objects"));
+  await writeConfig(join(workspace, ".omp"), { externalWrites: "deny" });
+  const handler = registerHandler(agentDir);
+  for (const command of [
+    `GIT_INDEX_FILE=${join(outside, "index")} git add .`,
+    `env GIT_OBJECT_DIRECTORY=${join(outside, "objects")} git commit -m update`,
+  ]) {
+    const result = await handler({ toolName: "bash", input: { command } }, context(workspace));
+    assert.equal(result.block, true, command);
+    assert.match(result.reason, /Write outside workspace denied/);
+  }
+});
+
+test("fails closed without caching approval when Git metadata cannot be resolved", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "allow",
+    protectedPaths: { paths: [join(workspace, "secret")], policy: "prompt" },
+  });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+  const event = { toolName: "bash", input: { command: "git add ." } };
+  const headless = await handler(event, context(workspace));
+  const approved = await handler(event, context(workspace, { hasUI: true, approve: true, prompts }));
+  const repeated = await handler(event, context(workspace));
+  assert.equal(headless.block, true);
+  assert.equal(approved, undefined);
+  assert.equal(repeated.block, true);
+  assert.equal(prompts.length, 1);
+});
+
+test("resolves commit metadata without running the requested commit or its hooks", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await writeFile(join(workspace, "tracked.txt"), "initial\n");
+  await runGit(workspace, "add", "tracked.txt");
+  const hooks = join(workspace, "hooks");
+  const marker = join(workspace, "hook-ran");
+  await mkdir(hooks);
+  await writeFile(join(hooks, "pre-commit"), `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+  const handler = registerHandler(agentDir);
+  const result = await handler(
+    { toolName: "bash", input: { command: `git -c core.hooksPath=${hooks} commit -m initial` } },
+    context(workspace),
+  );
+  assert.equal(result, undefined);
+  await assert.rejects(lstat(marker), { code: "ENOENT" });
+  await assert.rejects(runGit(workspace, "rev-parse", "--verify", "HEAD"));
+});
+
+test("isolates real Git fixtures from inherited repository and trace overrides", async (t) => {
+  const { workspace, outside } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await runGit(outside, "init", "--quiet");
+  await writeFile(join(workspace, "tracked.txt"), "local\n");
+  const callerIndex = join(outside, "caller-index");
+  const trace = join(outside, "caller-trace");
+  await writeFile(callerIndex, "caller index must not change\n");
+  const source = `
+    import { execFile as callback } from "node:child_process";
+    import { promisify } from "node:util";
+    const execFile = promisify(callback);
+    ${gitEnvironment.toString()}
+    ${runGit.toString()}
+    await runGit(${JSON.stringify(workspace)}, "add", "tracked.txt");
+  `;
+  await execFile(process.execPath, ["--input-type=module", "-e", source], {
+    env: gitEnvironment({
+      GIT_DIR: join(outside, ".git"), GIT_WORK_TREE: workspace,
+      GIT_COMMON_DIR: join(outside, ".git"), GIT_INDEX_FILE: callerIndex,
+      GIT_OBJECT_DIRECTORY: join(outside, ".git", "objects"), GIT_TRACE: trace,
+    }),
+  });
+  assert.equal(await readFile(callerIndex, "utf8"), "caller index must not change\n");
+  await assert.rejects(lstat(trace), { code: "ENOENT" });
+  const { stdout } = await runGit(workspace, "ls-files", "--stage", "tracked.txt");
+  assert.match(stdout, /100644 [0-9a-f]+ 0\ttracked\.txt\n/);
+  const other = await runGit(outside, "ls-files");
+  assert.equal(other.stdout, "");
+});
+
+test("guards original Git trace files independently of metadata paths", async (t) => {
+  const { workspace, outside, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  const trace = join(workspace, "protected.log");
+  await writeFile(trace, "unchanged\n");
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "allow",
+    protectedPaths: { paths: [trace], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+  for (const name of ["GIT_TRACE", "GIT_TRACE_SETUP", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF"]) {
+    const command = `${name}=${trace} git add .`;
+    const result = await handler({ toolName: "bash", input: { command } }, context(workspace));
+    assert.equal(result.block, true, name);
+    const inherited = await guardWithEnvironment(workspace, agentDir, "git add .", { [name]: trace });
+    assert.equal(inherited.block, true, `inherited ${name}`);
+  }
+  assert.equal(await readFile(trace, "utf8"), "unchanged\n");
+  const externalWorkspace = join(outside, "repo");
+  await mkdir(externalWorkspace);
+  await runGit(externalWorkspace, "init", "--quiet");
+  await writeConfig(join(externalWorkspace, ".omp"), { externalWrites: "deny" });
+  const external = await handler({ toolName: "bash", input: { command: `GIT_TRACE=${trace} git add .` } }, context(externalWorkspace));
+  assert.equal(external.block, true);
+});
+
+test("requires approval for protected trace files and allows descriptor-only tracing", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  const trace = join(workspace, "protected.log");
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "allow",
+    protectedPaths: { paths: [trace], policy: "prompt" },
+  });
+  const handler = registerHandler(agentDir);
+  const event = { toolName: "bash", input: { command: `GIT_TRACE=${trace} git commit -m update` } };
+  const prompts = [];
+  assert.equal((await handler(event, context(workspace))).block, true);
+  assert.equal(await handler(event, context(workspace, { hasUI: true, approve: true, prompts })), undefined);
+  assert.equal((await handler(event, context(workspace))).block, true);
+  assert.equal(prompts.length, 1);
+  await assert.rejects(lstat(trace), { code: "ENOENT" });
+  for (const value of ["0", "1", "2", "false", "true"]) {
+    const result = await handler({ toolName: "bash", input: { command: `GIT_TRACE=${value} git add .` } }, context(workspace));
+    assert.equal(result, undefined, value);
+  }
+});
+
+test("does not write trace files before denying Git metadata access", async (t) => {
+  const { workspace, outside, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  const trace = join(outside, "trace.log");
+  const setupTrace = join(outside, "setup.log");
+  const trace2 = join(outside, "trace2.log");
+  const eventTrace = join(outside, "event.log");
+  const perfTrace = join(outside, "perf.log");
+  await writeFile(trace, "existing\n");
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "deny",
+    protectedPaths: { paths: [join(workspace, ".git")], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+  const result = await handler({
+    toolName: "bash",
+    input: { command: `GIT_TRACE=${trace} GIT_TRACE_SETUP=${setupTrace} GIT_TRACE2=${trace2} GIT_TRACE2_EVENT=${eventTrace} GIT_TRACE2_PERF=${perfTrace} git add .` },
+  }, context(workspace));
+
+  assert.equal(result.block, true);
+  assert.equal(await readFile(trace, "utf8"), "existing\n");
+  for (const path of [setupTrace, trace2, eventTrace, perfTrace]) {
+    await assert.rejects(lstat(path), { code: "ENOENT" });
+  }
+});
+
+test("disables configured trace2 destinations during metadata probing", async (t) => {
+  const { root, workspace, outside, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  const gitConfig = join(root, "gitconfig");
+  const trace = join(outside, "trace2-config.log");
+  await writeFile(gitConfig, `[trace2]\n\tnormalTarget = ${trace}\n\teventTarget = ${trace}\n\tperfTarget = ${trace}\n`);
+  await writeConfig(join(workspace, ".omp"), {
+    protectedPaths: { paths: [join(workspace, ".git")], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+  const result = await handler({
+    toolName: "bash",
+    input: { command: `GIT_CONFIG_GLOBAL=${gitConfig} git add .` },
+  }, context(workspace));
+
+  assert.equal(result.block, true);
+  await assert.rejects(lstat(trace), { code: "ENOENT" });
+});
+
+test("keeps dynamic Git metadata behind deny-protected paths when external writes are allowed", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "allow",
+    protectedPaths: { paths: [join(workspace, ".git", "index")], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+  for (const command of [
+    'git -c user.name="$USER" add .',
+    'GIT_INDEX_FILE="$INDEX_FILE" git commit -m update',
+    'cd "$REPO" && git add .',
+  ]) {
+    const result = await handler(
+      { toolName: "bash", input: { command } },
+      context(workspace, { hasUI: true, approve: true, prompts }),
+    );
+    assert.equal(result.block, true, command);
+  }
+  assert.deepEqual(prompts, []);
+});
+
+test("requires non-cached protected-path approval for dynamic Git metadata", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "allow",
+    protectedPaths: { paths: [join(workspace, ".git", "index")], policy: "prompt" },
+  });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+  const event = { toolName: "bash", input: { command: 'git -c user.name="$USER" add .' } };
+  const headless = await handler(event, context(workspace));
+  const approved = await handler(event, context(workspace, { hasUI: true, approve: true, prompts }));
+  const repeated = await handler(event, context(workspace));
+
+  assert.equal(headless.block, true);
+  assert.equal(approved, undefined);
+  assert.equal(repeated.block, true);
+  assert.equal(prompts.length, 1);
+});
+
+test("guards the lock path of a custom Git index before it exists", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  const lock = join(workspace, "alt-index.lock");
+  await writeConfig(join(workspace, ".omp"), {
+    protectedPaths: { paths: [lock], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+  for (const command of ["GIT_INDEX_FILE=alt-index git add .", "GIT_INDEX_FILE=alt-index git commit -m update"]) {
+    const result = await handler({ toolName: "bash", input: { command } }, context(workspace));
+    assert.equal(result.block, true, command);
+  }
+  await assert.rejects(lstat(lock), { code: "ENOENT" });
+});
+
+test("guards the resolved lock path of a symlinked Git index", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await mkdir(join(workspace, "state"));
+  const index = join(workspace, "state", "index");
+  await writeFile(index, "");
+  await symlink(index, join(workspace, "linked-index"));
+  await writeConfig(join(workspace, ".omp"), {
+    protectedPaths: { paths: [`${index}.lock`], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+  const result = await handler(
+    { toolName: "bash", input: { command: "GIT_INDEX_FILE=linked-index git add ." } },
+    context(workspace),
+  );
+
+  assert.equal(result.block, true);
+});
+
+test("fails closed for environment-changing wrappers instead of probing inherited Git metadata", async (t) => {
+  const { workspace, outside, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await runGit(outside, "init", "--quiet");
+  await writeConfig(join(workspace, ".omp"), { externalWrites: "deny" });
+  const inherited = { GIT_DIR: join(workspace, ".git") };
+  for (const wrapper of [
+    "env --unset=GIT_DIR",
+    "env -u GIT_DIR",
+    "env -uGIT_DIR",
+    "env -i",
+    "env --ignore-environment",
+    "env -",
+    "env env --unset=GIT_DIR",
+    "sudo",
+  ]) {
+    const command = `${wrapper} git -C ${outside} add tracked.txt`;
+    const result = await guardWithEnvironment(workspace, agentDir, command, inherited);
+    assert.equal(result.block, true, command);
+  }
+  const local = await guardWithEnvironment(workspace, agentDir, "git add .", inherited);
+  assert.equal(local, null);
+});
+
+test("keeps shell Git environment changes behind path protection", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "allow",
+    protectedPaths: { paths: [join(workspace, "alt-index")], policy: "deny" },
+  });
+  const inherited = { GIT_INDEX_FILE: join(workspace, "default-index") };
+  for (const command of [
+    "export GIT_INDEX_FILE=alt-index; git add tracked.txt",
+    "GIT_INDEX_FILE=alt-index; git add tracked.txt",
+    "declare -x GIT_INDEX_FILE=alt-index; git add tracked.txt",
+    "printf -v GIT_INDEX_FILE %s alt-index; git add tracked.txt",
+    "env -- GIT_INDEX_FILE=alt-index git add tracked.txt",
+  ]) {
+    const result = await guardWithEnvironment(workspace, agentDir, command, inherited);
+    assert.equal(result.block, true, command);
+  }
+});
+
+test("fails closed for Git append assignments and unparsed shell groups", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "allow",
+    protectedPaths: { paths: [join(workspace, "alt-index")], policy: "deny" },
+  });
+  for (const command of [
+    "export GIT_INDEX_FILE+=-index; git add tracked.txt",
+    "GIT_INDEX_FILE+=-index; git add tracked.txt",
+    "GIT_INDEX_FILE+=-index git add tracked.txt",
+    "declare -x GIT_INDEX_FILE+=-index; git commit -m update",
+    "{ export GIT_INDEX_FILE=alt-index; }; git add tracked.txt",
+    "{ export GIT_INDEX_FILE=alt-index; }; git commit -m update",
+  ]) {
+    const result = await guardWithEnvironment(workspace, agentDir, command, { GIT_INDEX_FILE: "alt" });
+    assert.equal(result.block, true, command);
+  }
+});
+
+test("does not expand quoted or escaped Git tilde paths into the home directory", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await mkdir(join(workspace, "~"));
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "allow",
+    protectedPaths: { paths: [join(workspace, "~", "alt-index")], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+  for (const command of [
+    "GIT_INDEX_FILE='~/alt-index' git add .",
+    'GIT_INDEX_FILE="~/alt-index" git commit -m update',
+    "GIT_INDEX_FILE=\\~/alt-index git add .",
+  ]) {
+    const result = await handler({ toolName: "bash", input: { command } }, context(workspace));
+    assert.equal(result.block, true, command);
+  }
+});
+
+test("does not cache approval or retain uncertain Git environment state across Bash calls", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await writeConfig(join(workspace, ".omp"), {
+    externalWrites: "allow",
+    protectedPaths: { paths: [join(workspace, "alt-index")], policy: "prompt" },
+  });
+  const handler = registerHandler(agentDir);
+  const prompts = [];
+  const event = { toolName: "bash", input: { command: "export GIT_INDEX_FILE=alt-index; git add tracked.txt" } };
+  const headless = await handler(event, context(workspace));
+  const approved = await handler(event, context(workspace, { hasUI: true, approve: true, prompts }));
+  const repeated = await handler(event, context(workspace));
+  const normal = await handler({ toolName: "bash", input: { command: "git add ." } }, context(workspace));
+
+  assert.equal(headless.block, true);
+  assert.equal(approved, undefined);
+  assert.equal(repeated.block, true);
+  assert.equal(prompts.length, 1);
+  assert.equal(normal, undefined);
+});
+
+test("allows ordinary Git environment prefixes and unrelated shell exports", async (t) => {
+  const { workspace, agentDir } = await fixture(t);
+  await runGit(workspace, "init", "--quiet");
+  await writeConfig(join(workspace, ".omp"), {
+    protectedPaths: { paths: [join(workspace, "protected.txt")], policy: "deny" },
+  });
+  const handler = registerHandler(agentDir);
+  for (const command of [
+    "export BUILD_MODE=release; git add .",
+    "env GIT_INDEX_FILE=allowed-index git add .",
+    "GIT_INDEX_FILE=state/sudo git add .",
+    "env -- git add .",
+    "git add . && git commit -m update",
+  ]) {
+    const result = await handler({ toolName: "bash", input: { command } }, context(workspace));
+    assert.equal(result, undefined, command);
+  }
+});
+
 test("allows a same-command cleanup of an mktemp directory", async (t) => {
   const { workspace, agentDir } = await fixture(t);
   await writeConfig(join(workspace, ".omp"), { temporary: { root: tmpdir(), allowAll: false } });
