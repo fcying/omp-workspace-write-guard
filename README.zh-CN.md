@@ -191,7 +191,7 @@ omp config set tools.approval '{"bash":"allow","task":"allow","eval":"allow","hu
 - `task`: 委派给 worker agent 的任务。
 - `eval`: 持久化 Python 和 JavaScript kernel。
 - `hub`: agent 协调及后台进程控制。
-- `browser`: Chromium 自动化。通过 `write(path="xd://browser")` 路由的调用继承此策略, 因此允许 `browser` 后不会再出现外层 `Allow tool: write` 提示。
+- `browser`: Chromium 自动化。OMP 19.1+ 不再通过 `write(path="xd://browser")` 路由浏览器调用; Bash 激活时, 挂载的 tool command 使用 `browser` 工具自身的审批策略, 而不是外层 `write` 策略。
 
 这些都是可执行工具。`bash`、`eval`、`browser.run`、后台进程和委派 agent 都可能产生无法从显式文件目标中识别的文件系统副作用。只在可信仓库及命令中使用这组配置。与 `yolo` 不同, 未列出的其他可执行工具仍需确认。
 
@@ -276,7 +276,7 @@ guard 使用 `git rev-parse` 查询这些路径, 保留仓库选择选项及命�
 
 `git push` 检测覆盖直接调用、wrapper、`git -C`、Git 全局选项和复合命令。`gitPush: "deny"` 时立即拒绝且不打开确认框; `"prompt"` 时独立确认; `"allow"` 时仍保留仓库路径检查。
 
-普通文件、归档条目、SQLite 行写入和 `file://` URL 按其底层文件路径判断。`conflict://` 写入按当前会话登记的底层冲突文件路径判断。`local://`, `xd://`, `agent://` 和 `proc://` 不做文件路径检查。已知只读资源 (`artifact://`, `attachment://`, `history://`, `issue://`, `memory://`, `omp://`, `pr://`, `rule://`, `security://`, `skill://`) 不触发外部写入提示; OMP 会拒绝对它们的写入。`cfg://`, `mcp://`, `ssh://`, `vault://` 和未知前缀仍按不透明目标保守处理。
+普通文件、归档条目、SQLite 行写入和 `file://` URL 按其底层文件路径判断。`conflict://` 写入按当前会话登记的底层冲突文件路径判断。`local://`, `agent://` 和 `proc://` 不做文件路径检查. 本插件也继续排除旧版 `xd://` 目标, 但 OMP 19.1+ 已用 tool command 替代 `xd://` 工具设备路由. 挂载的工具按各自工具名分发, 因此本插件支持的显式文件目标工具仍执行原有检查; 任意工具的副作用仍不在 Bash 解析器覆盖范围内. OMP 19.1+ 使用只读工具文档 scheme `help://` 替代 `xd://<tool>/<topic>`. 读取不会被当作文件目标. 本插件会将 `write(help://...)` 按不透明目标处理, 因此 OMP 拒绝只读写入前, `externalWrites` 可能先弹出确认. 其他已知只读资源 (`artifact://`, `attachment://`, `history://`, `issue://`, `memory://`, `omp://`, `pr://`, `rule://`, `security://`, `skill://`) 不触发外部写入提示; OMP 会拒绝对它们的写入. `cfg://`, `mcp://`, `ssh://`, `vault://` 和未知前缀仍按不透明目标保守处理.
 
 任意 LSP `request` 按 `lspRequests` 处理, 默认放行. 设置为 `"prompt"` 时, 确认显示请求方法, 不再声称已发现外部文件目标, 批准不会被记住. 与旧版本不同, `externalWrites` 不再控制 LSP 请求; 如需确认或拒绝, 显式设置 `lspRequests`.
 
